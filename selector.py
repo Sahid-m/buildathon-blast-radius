@@ -378,6 +378,35 @@ class Sources:
                     pass
         return self._fx
 
+    def test_word_users(self, word: str) -> int:
+        key = "tw:" + word.lower()
+        v = self._users.get(key)
+        if v is not None:
+            return v
+        v = 0
+        low = word.lower()
+        pat = re.compile(r"\b" + re.escape(low) + r"\b")
+        for f, (txt, starts) in self.texts().items():
+            if f.startswith("sqlglot/"):
+                continue
+            lt = self.lower_text(f, txt)
+            if low not in lt:
+                continue
+            fl = self.cov.lines.get(f) or {}
+            spans = self.META_COPY_SPANS.get(f, ())
+            for m in pat.finditer(lt):
+                ln = bisect_right(starts, m.start())
+                if any(a <= ln <= b for a, b in spans):
+                    continue
+                i = fl.get(str(ln))
+                if i is not None:
+                    v |= self.cov.set(i)
+        for f, lt in self.fixture_texts().items():
+            if low in lt and pat.search(lt):
+                v |= self.fixture_openers(f)
+        self._users[key] = v
+        return v
+
     def fixture_openers(self, f: str) -> int:
         if f == "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
             return self.cov.id_mask("tests/test_optimizer.py::TestOptimizer::test_tpcds") | self.cov.id_mask("tests/test_executor.py::TestExecutor::test_execute_tpcds")
@@ -403,22 +432,32 @@ class Sources:
             if low not in lt:
                 continue
             fl = self.cov.lines.get(f) or {}
+            if not fl:
+                continue
             seen = set()
-            rt = self.def_lines(f, txt) if f.startswith("sqlglot/") else None
+            need_rt = f.startswith("sqlglot/")
+            rt = None
             spans = self.META_COPY_SPANS.get(f, ())
             for m in pat.finditer(lt):
                 ln = bisect_right(starts, m.start())
                 if ln in seen:
                     continue
                 seen.add(ln)
+                i = fl.get(str(ln))
+                if i is None:
+                    continue
                 if any(a <= ln <= b for a, b in spans):
                     continue
-                if rt is not None and ln not in rt:
-                    continue  # import-time line in the library: runs for every importer
+                if need_rt:
+                    if rt is None:
+                        rt = self.def_lines(f, txt)
+                    if ln not in rt:
+                        continue  # import-time line in the library: runs for every importer
                 ln = self.SHORT_CIRCUIT_LINES.get((low.upper(), f, ln), ln)
                 i = fl.get(str(ln))
-                if i is not None:
-                    v |= self.cov.set(i)
+                if i is None:
+                    continue
+                v |= self.cov.set(i)
         if include_fixtures:
             for f, lt in self.fixture_texts().items():
                 if low in lt and pat.search(lt):
@@ -436,37 +475,83 @@ class Sources:
                 self._trees[f] = None
         return self._trees[f]
 
-    def def_lines(self, f, txt):
-        """Lines strictly inside def bodies or multi-line lambda continuations (never import-time)."""
+    def _def_and_rt(self, f, txt):
         if not hasattr(self, "_defl"):
             self._defl = {}
-        r = self._defl.get(f)
-        if r is None:
-            r = set()
-            tree = self.tree(f, txt)
-            if tree is not None:
-                for node in ast.walk(tree):
-                    if isinstance(node, FUNC):
-                        r.update(range(node.body[0].lineno, node.end_lineno + 1))
-                    elif isinstance(node, ast.Lambda) and node.end_lineno > node.lineno:
-                        r.update(range(node.lineno + 1, node.end_lineno + 1))
-            self._defl[f] = r
-        return r
+            self._rt = {}
+        d = self._defl.get(f)
+        if d is not None:
+            return d, self._rt[f]
+        defl = set()
+        rt = set()
+        tree = self.tree(f, txt)
+        if tree is None:
+            self._defl[f] = defl
+            self._rt[f] = rt
+            return defl, rt
+        starts = self.texts()[f][1]
+        has_lam = "lambda" in txt
+        n_starts = len(starts)
+
+        def slice_has_lambda(node):
+            if not has_lam:
+                return False
+            ln = getattr(node, "lineno", None)
+            eln = getattr(node, "end_lineno", None)
+            if ln is None or eln is None:
+                return True
+            s = starts[ln - 1]
+            e = starts[eln] if eln < n_starts else len(txt)
+            return "lambda" in txt[s:e]
+
+        def walk_expr(node):
+            stack = [node]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, ast.Lambda):
+                    rt.update(range(cur.lineno, cur.end_lineno + 1))
+                    if cur.end_lineno > cur.lineno:
+                        defl.update(range(cur.lineno + 1, cur.end_lineno + 1))
+                    else:
+                        stack.append(cur.body)
+                elif getattr(cur, "end_lineno", None) is not None and not slice_has_lambda(cur):
+                    continue
+                else:
+                    stack.extend(ast.iter_child_nodes(cur))
+
+        stmt_stack = list(tree.body)
+        while stmt_stack:
+            st = stmt_stack.pop()
+            if isinstance(st, FUNC):
+                s, e = st.body[0].lineno, st.end_lineno + 1
+                defl.update(range(s, e))
+                rt.update(range(s, e))
+                if has_lam and "lambda" in txt[starts[st.lineno - 1] : starts[s]]:
+                    walk_expr(st.args)
+            elif isinstance(st, ast.ClassDef):
+                stmt_stack.extend(st.body)
+            elif isinstance(st, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
+                for attr in ("body", "orelse", "finalbody"):
+                    stmt_stack.extend(getattr(st, attr, ()))
+                for h in getattr(st, "handlers", ()):
+                    stmt_stack.extend(h.body)
+                if slice_has_lambda(st):
+                    for child in ast.iter_child_nodes(st):
+                        if not isinstance(child, ast.stmt) and not isinstance(child, ast.ExceptHandler):
+                            walk_expr(child)
+            elif slice_has_lambda(st):
+                walk_expr(st)
+        self._defl[f] = defl
+        self._rt[f] = rt
+        return defl, rt
+
+    def def_lines(self, f, txt):
+        """Lines strictly inside def bodies or multi-line lambda continuations (never import-time)."""
+        return self._def_and_rt(f, txt)[0]
 
     def runtime_lines(self, f, txt):
         """Lines inside function/lambda bodies (they run only when called)."""
-        if not hasattr(self, "_rt"):
-            self._rt = {}
-        r = self._rt.get(f)
-        if r is None:
-            r = set(self.def_lines(f, txt))
-            tree = self.tree(f, txt)
-            if tree is not None:
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Lambda):
-                        r.update(range(node.lineno, node.end_lineno + 1))
-            self._rt[f] = r
-        return r
+        return self._def_and_rt(f, txt)[1]
 
     def load_lines(self, f, txt) -> dict[str, set[int]]:
         """Map identifier -> set of line numbers where identifier is READ at runtime,
@@ -497,37 +582,12 @@ class Sources:
                         res.setdefault(node.value, set()).add(ln)
 
         _add_loads(tree, allow_all_lines=(defl is None))
+        if defl is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Lambda):
+                    _add_loads(node.body, allow_all_lines=True)
         self._loads[f] = res
         return res
-
-    def test_word_users(self, word: str) -> int:
-        key = "tw:" + word.lower()
-        v = self._users.get(key)
-        if v is not None:
-            return v
-        v = 0
-        low = word.lower()
-        pat = re.compile(r"\b" + re.escape(low) + r"\b")
-        for f, (txt, starts) in self.texts().items():
-            if f.startswith("sqlglot/"):
-                continue
-            lt = self.lower_text(f, txt)
-            if low not in lt:
-                continue
-            fl = self.cov.lines.get(f) or {}
-            spans = self.META_COPY_SPANS.get(f, ())
-            for m in pat.finditer(lt):
-                ln = bisect_right(starts, m.start())
-                if any(a <= ln <= b for a, b in spans):
-                    continue
-                i = fl.get(str(ln))
-                if i is not None:
-                    v |= self.cov.set(i)
-        for f, lt in self.fixture_texts().items():
-            if low in lt and pat.search(lt):
-                v |= self.fixture_openers(f)
-        self._users[key] = v
-        return v
 
     def lower_text(self, f, txt):
         if not hasattr(self, "_lower"):
@@ -537,36 +597,40 @@ class Sources:
             lt = self._lower[f] = txt.lower()
         return lt
 
-    CLASS_PAT = re.compile(r"^\s*class\s+(\w+)\s*\(([^)]*)\)", re.M)
-
     def subclasses(self, name: str) -> set[str]:
-        if not hasattr(self, "_subc"):
-            self._subc = {}
-        cached = self._subc.get(name)
-        if cached is not None:
-            return cached
-        generic = {"Tokenizer", "Parser", "Generator", "JSONPathTokenizer", "_TrinoTokenizer"}
+        if not hasattr(self, "_sub_map"):
+            self._sub_map: dict[str, set[str]] = {}
+            generic = {"Tokenizer", "Parser", "Generator", "JSONPathTokenizer", "_TrinoTokenizer"}
+            pat = re.compile(r"^\s*class\s+(\w+)\s*\(([^)]*)\)", re.M)
+            for f, (txt, _) in self.texts().items():
+                if "class " not in txt:
+                    continue
+                for m in pat.finditer(txt):
+                    cls_name = m.group(1)
+                    if cls_name in generic:
+                        continue
+                    for b in m.group(2).split(","):
+                        b = b.strip().split(".")[0]
+                        if b:
+                            self._sub_map.setdefault(b, set()).add(cls_name)
         out = {name}
         frontier = [name]
         while frontier:
             n = frontier.pop()
-            for f, (txt, _) in self.texts().items():
-                if n not in txt:
-                    continue
-                for m in self.CLASS_PAT.finditer(txt):
-                    cls_name = m.group(1)
-                    if cls_name in generic or cls_name in out:
-                        continue
-                    bases = [b.strip().split(".")[0] for b in m.group(2).split(",") if b.strip()]
-                    if n in bases:
-                        out.add(cls_name)
-                        frontier.append(cls_name)
-        self._subc[name] = out
+            for cls_name in self._sub_map.get(n, ()):
+                if cls_name not in out:
+                    out.add(cls_name)
+                    frontier.append(cls_name)
         return out
 
     CAMEL_SPLIT = re.compile(r"(?<!^)(?=[A-Z][a-z])|(?<=[a-z0-9])(?=[A-Z])")
 
     def class_users(self, outer: str, inner: str) -> int:
+        if not hasattr(self, "_cls_users"):
+            self._cls_users = {}
+        key = (outer, inner)
+        if key in self._cls_users:
+            return self._cls_users[key]
         v = 0
         nested_generic = {"Tokenizer", "Parser", "Generator", "JSONPathTokenizer"}
         roots = set(self.subclasses(outer)) if inner in nested_generic and outer != inner else (self.subclasses(outer) | self.subclasses(inner))
@@ -586,6 +650,7 @@ class Sources:
                 if c.endswith(suf) and len(c) > len(suf):
                     stem = c[: -len(suf)]
                     v |= self.users_ci(stem)
+        self._cls_users[key] = v
         return v
 
     # Metaclass/init copy aliases: attribute defined on class -> derived attribute read at runtime
@@ -674,29 +739,64 @@ class Sources:
         extra = (name.lower(),) if name.isupper() and len(name) > 3 else ()
         query_names = (name,) + self.DERIVED_ATTRS.get(name, ()) + extra
         for qn in query_names:
-            pat = None
+            pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(qn) + r"(?![A-Za-z0-9_])")
             for f, (txt, starts) in self.texts().items():
                 if qn not in txt:
                     continue
                 fl = self.cov.lines.get(f) or {}
+                if not fl:
+                    continue
                 if f.startswith("sqlglot/"):
-                    loads = self.load_lines(f, txt).get(qn)
-                    if not loads:
-                        continue
-                    rt = self.runtime_lines(f, txt)
                     spans = self.META_COPY_SPANS.get(f, ())
-                    for ln in loads:
+                    rt = None
+                    match_lns = set()
+                    for m in pat.finditer(txt):
+                        ln = bisect_right(starts, m.start())
                         if any(a <= ln <= b for a, b in spans):
                             continue
-                        if ln not in rt:
+                        if rt is None:
+                            rt = self.runtime_lines(f, txt)
+                        if ln in rt:
+                            match_lns.add(ln)
+                    if not match_lns:
+                        continue
+                    tree = self.tree(f, txt)
+                    if tree is None:
+                        continue
+                    defl = self.def_lines(f, txt)
+                    loads = set()
+
+                    def walk_sub(root, allow_all):
+                        stack = [root]
+                        while stack:
+                            node = stack.pop()
+                            ln = getattr(node, "lineno", None)
+                            eln = getattr(node, "end_lineno", None)
+                            if ln is not None and eln is not None and not any(ln <= m <= eln for m in match_lns):
+                                continue
+                            if not allow_all and isinstance(node, ast.Lambda):
+                                if node.end_lineno > node.lineno:
+                                    walk_sub(node.body, True)
+                                continue
+                            nln = ln or 0
+                            if allow_all or nln in defl:
+                                if isinstance(node, ast.Name) and node.id == qn and isinstance(node.ctx, ast.Load):
+                                    loads.add(nln)
+                                elif isinstance(node, ast.Attribute) and node.attr == qn and isinstance(node.ctx, ast.Load):
+                                    loads.add(nln)
+                                elif isinstance(node, ast.Constant) and node.value == qn:
+                                    loads.add(nln)
+                            stack.extend(ast.iter_child_nodes(node))
+
+                    walk_sub(tree, False)
+                    for ln in loads:
+                        if any(a <= ln <= b for a, b in spans) or ln not in rt:
                             continue
                         ln = self.SHORT_CIRCUIT_LINES.get((qn, f, ln), ln)
                         i = fl.get(str(ln))
                         if i is not None:
                             v |= self.cov.set(i)
                 else:
-                    if pat is None:
-                        pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(qn) + r"(?![A-Za-z0-9_])")
                     seen = set()
                     for m in pat.finditer(txt):
                         ln = bisect_right(starts, m.start())
@@ -719,6 +819,7 @@ class Analysis:
         self.low = 0  # tests that might fail (candidates for verification)
         self.notes: list[str] = []
         self.patched: dict[str, str | None] = {}  # path -> new text (None = deleted)
+        self.changed_py: set[str] = set()
         self.unverifiable = False
 
 
@@ -949,19 +1050,59 @@ class _NormAST(ast.NodeTransformer):
         return node
 
 
-def ast_equivalent(t1: ast.AST, t2: ast.AST, old_text: str, new_text: str) -> bool:
+def _is_doc_stmt(s: ast.AST) -> bool:
+    return isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str)
+
+
+def _block_equiv(b1_raw: list[ast.stmt], b2_raw: list[ast.stmt], old_lines: list[str] | None = None, new_lines: list[str] | None = None) -> bool:
+    b1 = [s for s in b1_raw if not _is_doc_stmt(s)]
+    b2 = [s for s in b2_raw if not _is_doc_stmt(s)]
+    if len(b1) != len(b2):
+        return False
+    import copy
+
+    for s1, s2 in zip(b1, b2):
+        if type(s1) is not type(s2) or getattr(s1, "name", None) != getattr(s2, "name", None):
+            return False
+        if old_lines is not None and new_lines is not None and old_lines[s1.lineno - 1 : s1.end_lineno] == new_lines[s2.lineno - 1 : s2.end_lineno]:
+            continue
+        if (
+            isinstance(s1, ast.ClassDef)
+            and len(s1.decorator_list) == len(s2.decorator_list)
+            and len(s1.bases) == len(s2.bases)
+            and not s1.keywords
+            and not s2.keywords
+            and all(ast.dump(d1) == ast.dump(d2) for d1, d2 in zip(s1.decorator_list, s2.decorator_list))
+            and all(ast.dump(x1) == ast.dump(x2) for x1, x2 in zip(s1.bases, s2.bases))
+        ):
+            if _block_equiv(s1.body, s2.body, old_lines, new_lines):
+                continue
+            return False
+        if ast.dump(s1) == ast.dump(s2):
+            continue
+        n1 = _NormAST().visit(copy.deepcopy(s1))
+        n2 = _NormAST().visit(copy.deepcopy(s2))
+        if ast.dump(n1) != ast.dump(n2):
+            return False
+    return True
+
+
+def ast_equivalent(t1: ast.AST, t2: ast.AST, old_lines: list[str] | None = None, new_lines: list[str] | None = None) -> bool:
+    if isinstance(t1, ast.Module) and isinstance(t2, ast.Module):
+        return _block_equiv(t1.body, t2.body, old_lines, new_lines)
     if ast.dump(t1) == ast.dump(t2):
         return True
-    n1 = _NormAST().visit(ast.parse(old_text))
-    n2 = _NormAST().visit(ast.parse(new_text))
+    import copy
+
+    n1 = _NormAST().visit(copy.deepcopy(t1))
+    n2 = _NormAST().visit(copy.deepcopy(t2))
     return ast.dump(n1) == ast.dump(n2)
 
 
 def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
     imp = cov.importers(path)
-    try:
-        old_tree = ast.parse(old_text)
-    except SyntaxError:
+    old_tree = src.tree(path, old_text)
+    if old_tree is None:
         an.high |= imp
         return
     try:
@@ -970,15 +1111,18 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
         an.notes.append(f"syntax error {path} importers={bin(imp).count('1')}")
         an.high |= imp
         return
+    old_lines = old_text.split("\n")
+    new_lines = new_text.split("\n")
     # encoding cookie / first lines
     for ln in list(removed) + list(added):
         if ln <= 2:
-            txt = (old_text if ln in removed else new_text).split("\n")[ln - 1]
+            txt = (old_lines if ln in removed else new_lines)[ln - 1]
             if re.search(r"coding[:=]", txt):
                 an.high |= imp
-    if ast_equivalent(old_tree, new_tree, old_text, new_text):
+    if ast_equivalent(old_tree, new_tree, old_lines, new_lines):
         an.notes.append(f"ast-identical {path}")
         return
+    an.changed_py.add(path)
 
     # Statement-level diff: compare top-level / class-level / function bodies via
     # line-anchored analysis on both trees.
@@ -1073,7 +1217,7 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
                 "FORMAT_MAPPING",
             }
             expr_key_dicts = {"EXPRESSION_METADATA", "TRANSFORMS", "PROPERTIES_LOCATION"}
-            if names & (str_key_dicts | expr_key_dicts):
+            if (u & imp).bit_count() > 1 and (names & (str_key_dicts | expr_key_dicts)):
                 val = getattr(st, "value", None)
                 for dnode in ast.walk(val) if val is not None else ():
                     if isinstance(dnode, ast.Dict):
@@ -1101,9 +1245,12 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
                                     eu = cov.id_mask("tests/dialects/test_dialect.py::TestDialect::test_enum") | cov.id_mask(
                                         "tests/test_time.py::TestTime::test_canonical_time_format_vocabulary"
                                     )
-                                    for w_tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", dk.value):
-                                        if len(w_tok) >= 2:
-                                            eu |= src.test_word_users(w_tok)
+                                    _stop = {"FOR", "IN", "TO", "AS", "BY", "ON", "OF", "IS", "OR", "AND", "NOT", "WITH", "FROM", "SET", "ALL"}
+                                    toks = [w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", dk.value) if len(w) >= 2]
+                                    if any(w.upper() not in _stop for w in toks):
+                                        toks = [w for w in toks if w.upper() not in _stop]
+                                    for w_tok in toks:
+                                        eu |= src.test_word_users(w_tok)
                                     u &= eu
             touched |= u & imp
             an.notes.append(f"attr {path}:{line} names={sorted(names)} -> {bin(u & imp).count('1')}")
@@ -1276,10 +1423,35 @@ def build_farm(root: Path, patched: dict[str, str | None]) -> bool:
 
 
 CHILD_CODE = None
+_FIXTURE_PAIRS_CACHE: dict[str, tuple] = {}
+_TPCDS_SCHEMA_OBJ = None
+_TPCH_SCHEMA_OBJ = None
+_TPCDS_PARSED: tuple | None = None
+_TPCH_PARSED: tuple | None = None
+
+_DIALECT_CHILDREN = {
+    "hive": {"hive", "athena", "databricks", "dune", "presto", "spark", "spark2", "trino"},
+    "spark2": {"spark2", "spark", "databricks"},
+    "spark": {"spark", "databricks"},
+    "presto": {"presto", "trino", "athena", "dune"},
+    "trino": {"trino", "athena", "dune"},
+    "mysql": {"mysql", "athena", "doris", "drill", "dune", "presto", "singlestore", "starrocks", "trino"},
+    "postgres": {"postgres", "redshift", "materialize", "risingwave"},
+    "tsql": {"tsql", "fabric"},
+}
 
 
-def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: list[int], all_ln: list[int], dur: list[int], wfd: int):
+def _get_fixture_pairs(rel: str, patched: dict):
+    if f"tests/fixtures/{rel}" not in patched and rel in _FIXTURE_PAIRS_CACHE:
+        return _FIXTURE_PAIRS_CACHE[rel]
+    from tests.helpers import load_sql_fixture_pairs
+
+    return tuple(load_sql_fixture_pairs(rel))
+
+
+def run_child(farm: Path, patched: dict, changed_py: set[str], nums: list[int], ids: list[str], hn: list[int], all_ln: list[int], dur: list[int], wfd: int):
     """In a forked child: run the given test ids with direct unittest in `farm`."""
+    from collections import deque
     import importlib
     import resource
     import unittest
@@ -1298,9 +1470,11 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
     sys.path[:] = [str(farm)] + [p for p in sys.path if p and not p.startswith(str(REPO))]
     importlib.invalidate_caches()
 
-    # Check if any patched .py file is an already-imported module in sys.modules
-    patched_mods = {p[:-3].replace("/", ".") for p in patched if p.endswith(".py")}
+    # Check if any non-AST-identical patched .py file is an already-imported module in sys.modules
+    reloaded_sqlglot = False
+    patched_mods = {p[:-3].replace("/", ".") for p in changed_py if p.endswith(".py")}
     if any(m in sys.modules or (m.endswith(".__init__") and m[:-9] in sys.modules) for m in patched_mods):
+        reloaded_sqlglot = True
         for k in list(sys.modules):
             if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
                 del sys.modules[k]
@@ -1315,6 +1489,22 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
 
     os.environ["SKIP_INTEGRATION"] = "0"
     import concurrent.futures as cf
+
+    check_pickle = any(p in ("sqlglot/serde.py", "sqlglot/expressions/core.py") for p in changed_py)
+    can_reuse_parsed = (not reloaded_sqlglot) and not any(
+        p.startswith(("sqlglot/parser", "sqlglot/tokens", "sqlglot/tokenizer", "sqlglot/dialects/", "sqlglot/expressions/"))
+        for p in changed_py
+    )
+
+    affected_dialects: set[str] = set()
+    if changed_py and all(
+        p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
+        and Path(p).stem not in ("__init__", "dialect", "base", "duckdb")
+        for p in changed_py
+    ):
+        for p in changed_py:
+            stem = Path(p).stem
+            affected_dialects |= _DIALECT_CHILDREN.get(stem, {stem})
 
     class LazyFuture:
         """Evaluate submitted work lazily on .result() so early subTest failure skips remaining work."""
@@ -1333,7 +1523,14 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
             if not self._done:
                 self._done = True
                 try:
-                    self._res = self._fn(*self._a, **self._k)
+                    if check_pickle:
+                        import pickle
+
+                        a = pickle.loads(pickle.dumps(self._a))
+                        k = pickle.loads(pickle.dumps(self._k))
+                        self._res = pickle.loads(pickle.dumps(self._fn(*a, **k)))
+                    else:
+                        self._res = self._fn(*self._a, **self._k)
                 except BaseException as e:
                     self._exc = e
             if self._exc is not None:
@@ -1389,73 +1586,104 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
     mod_cache = {}
     cls_setup_done = set()
     cls_setup_failed = set()
+    validator_patched = False
 
-    confirmed_fail = set(hn)
-    remaining_cands = set(all_ln)
+    confirmed_fail = set(hn) | (set(all_ln) - set(nums))
+    remaining_cands = set(nums)
     fail_count = 0
     pass_count = 0
     test_outcomes: dict[str, bool] = {}
     can_surrogate_tpc = not any(
-        p.startswith(("sqlglot/serde.py", "sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/merge_subqueries.py", "sqlglot/generators/duckdb.py", "sqlglot/dialects/duckdb.py", "tests/test_executor.py", "tests/test_optimizer.py", "tests/fixtures/optimizer/tpc-"))
+        p.startswith(("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/merge_subqueries.py", "sqlglot/generators/duckdb.py", "sqlglot/dialects/duckdb.py", "tests/test_executor.py"))
         for p in patched
     )
     can_surrogate_max_nodes = "tests/test_parser.py" not in patched
     can_surrogate_gen_mem = not any(p in ("tests/test_generator.py", "sqlglot/generator.py", "sqlglot/dialects/dialect.py") for p in patched)
 
-    dialect_deps = {
-        "hive": ("athena", "databricks", "dune", "presto", "spark", "spark2", "trino"),
-        "mysql": ("athena", "doris", "drill", "dune", "presto", "singlestore", "starrocks", "trino"),
-        "postgres": ("materialize", "redshift", "risingwave"),
-        "presto": ("athena", "dune", "trino"),
-        "spark": ("databricks",),
-        "spark2": ("databricks", "spark"),
-        "trino": ("athena", "dune"),
-        "tsql": ("fabric",),
-    }
-    py_patched = [p for p in patched if p.endswith(".py")]
-    affected_dialects: set[str] | None = set() if py_patched else None
-    patched_stems: set[str] = set()
-    for p in py_patched:
-        stem = Path(p).stem.lower()
-        patched_stems.add(stem)
-        m_d = re.match(r"^sqlglot/(?:dialects|parsers|generators|typing)/(\w+)\.py$", p)
-        if m_d and m_d.group(1) not in ("__init__", "dialect", "base") and affected_dialects is not None:
-            d_name = m_d.group(1).lower()
-            affected_dialects.add(d_name)
-            affected_dialects.update(dialect_deps.get(d_name, ()))
-        else:
-            affected_dialects = None
-
-    # Order tests matching patched module stems first among fast tests so failures are caught immediately
-    if patched_stems and len(nums) > 1:
-        paired = sorted(
-            zip(nums, ids),
-            key=lambda x: (
-                0 if dur[x[0]] < 250 and any(f"test_{s}.py" in x[1] for s in patched_stems) else (1 if dur[x[0]] < 250 else 2),
-                dur[x[0]],
-            ),
-        )
-        nums = [x[0] for x in paired]
-        ids = [x[1] for x in paired]
-
     def _fast_tpc_check(kind: str) -> bool:
-        from tests.helpers import load_sql_fixture_pairs, TPCDS_SCHEMA, TPCH_SCHEMA
+        if kind in test_outcomes:
+            return test_outcomes[kind]
+        from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA
         from sqlglot import parse_one
         from sqlglot.optimizer import optimize
         from sqlglot.schema import ensure_schema
 
-        if kind == "tpcds":
-            schema = ensure_schema(TPCDS_SCHEMA)
-            for meta, sql, opt in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"):
+        if check_pickle:
+            import pickle
+
+        if kind in ("tpcds_exec", "tpcds_rest"):
+            only_exec = kind == "tpcds_exec"
+            schema = _TPCDS_SCHEMA_OBJ if (not reloaded_sqlglot and _TPCDS_SCHEMA_OBJ is not None) else ensure_schema(TPCDS_SCHEMA)
+            if can_reuse_parsed and _TPCDS_PARSED is not None and "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" not in patched:
+                for meta, sql, ast_node, opt in _TPCDS_PARSED:
+                    if bool(meta.get("execute")) == only_exec:
+                        res = optimize(ast_node, schema=schema)
+                        if check_pickle:
+                            pickle.loads(pickle.dumps(res))
+                        if res.sql(pretty=True) != opt:
+                            test_outcomes[kind] = False
+                            return False
+            else:
+                for meta, sql, opt in _get_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql", patched):
+                    if bool(meta.get("execute")) == only_exec:
+                        e = parse_one(sql)
+                        if check_pickle:
+                            pickle.loads(pickle.dumps(e))
+                        res = optimize(e, schema=schema)
+                        if check_pickle:
+                            pickle.loads(pickle.dumps(res))
+                        if res.sql(pretty=True) != opt:
+                            test_outcomes[kind] = False
+                            return False
+            test_outcomes[kind] = True
+            return True
+        elif kind == "tpch_exec":
+            schema = _TPCH_SCHEMA_OBJ if (not reloaded_sqlglot and _TPCH_SCHEMA_OBJ is not None) else ensure_schema(TPCH_SCHEMA)
+            for meta, sql, opt in _get_fixture_pairs("optimizer/tpc-h/tpc-h.sql", patched):
+                e = parse_one(sql)
+                if check_pickle:
+                    pickle.loads(pickle.dumps(e))
                 if meta.get("execute"):
-                    if optimize(parse_one(sql), schema=schema).sql(pretty=True) != opt:
+                    res = optimize(e, schema=schema)
+                    if check_pickle:
+                        pickle.loads(pickle.dumps(res))
+                    if res.sql(pretty=True) != opt:
+                        test_outcomes[kind] = False
                         return False
+            test_outcomes[kind] = True
+            return True
+        elif kind == "tpch_transpile":
+            if "tests/fixtures/optimizer/tpc-h/tpc-h.sql" in patched:
+                return _fast_tpc_check("tpch_opt")
+            from sqlglot import transpile
+
+            for meta, sql, opt in _get_fixture_pairs("optimizer/tpc-h/tpc-h.sql", patched):
+                transpile(sql, write="duckdb")
+                transpile(opt, write="duckdb")
+            test_outcomes[kind] = True
             return True
         else:
-            schema = ensure_schema(TPCH_SCHEMA)
-            for meta, sql, opt in load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"):
-                if optimize(parse_one(sql), schema=schema).sql(pretty=True) != opt:
-                    return False
+            schema = _TPCH_SCHEMA_OBJ if (not reloaded_sqlglot and _TPCH_SCHEMA_OBJ is not None) else ensure_schema(TPCH_SCHEMA)
+            if can_reuse_parsed and _TPCH_PARSED is not None and "tests/fixtures/optimizer/tpc-h/tpc-h.sql" not in patched:
+                for meta, sql, ast_node, opt in _TPCH_PARSED:
+                    res = optimize(ast_node, schema=schema)
+                    if check_pickle:
+                        pickle.loads(pickle.dumps(res))
+                    if res.sql(pretty=True) != opt:
+                        test_outcomes[kind] = False
+                        return False
+            else:
+                for meta, sql, opt in _get_fixture_pairs("optimizer/tpc-h/tpc-h.sql", patched):
+                    e = parse_one(sql)
+                    if check_pickle:
+                        pickle.loads(pickle.dumps(e))
+                    res = optimize(e, schema=schema)
+                    if check_pickle:
+                        pickle.loads(pickle.dumps(res))
+                    if res.sql(pretty=True) != opt:
+                        test_outcomes[kind] = False
+                        return False
+            test_outcomes[kind] = True
             return True
 
     def _fast_max_nodes_check() -> bool:
@@ -1483,26 +1711,40 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
             d.generator()
         return True
 
+    patched_stems = {Path(p).stem.lower() for p in changed_py if p.endswith(".py")}
+    if patched_stems and len(nums) > 1:
+        paired = sorted(
+            zip(nums, ids),
+            key=lambda x: (
+                0 if dur[x[0]] < 250 and any(f"test_{s}.py" in x[1] for s in patched_stems) else (1 if dur[x[0]] < 250 else 2),
+                dur[x[0]],
+            ),
+        )
+        nums = [x[0] for x in paired]
+        ids = [x[1] for x in paired]
+
+    queue = deque(zip(nums, ids))
     try:
-        for tnum, tid in zip(nums, ids):
+        while queue:
             # Slack & early-stop check: if keeping all remaining candidates costs the same as confirmed_fail, stop!
             if confirmed_fail:
                 c_now, _ = pack(sorted(confirmed_fail), dur)
                 c_all, _ = pack(sorted(confirmed_fail | remaining_cands), dur)
                 if c_all <= c_now:
                     break
+                tnum, tid = queue.pop()
                 # If this single test adds 0ms to pack(confirmed_fail) and we already have failures, skip running it
                 if fail_count >= 1 and dur[tnum] >= 40:
                     c_one, _ = pack(sorted(confirmed_fail | {tnum}), dur)
                     if c_one <= c_now:
+                        confirmed_fail.add(tnum)
+                        remaining_cands.discard(tnum)
                         continue
+            else:
+                tnum, tid = queue.popleft()
 
             parts = tid.split("::")
             fpath, cname, mname = parts[0], parts[1], parts[2]
-            # If sqlglot/serde.py is broken, ProcessPoolExecutor pickling fails even when InlinePool passes
-            if fail_count >= 2 and "sqlglot/serde.py" in patched:
-                break
-
             if can_surrogate_max_nodes and fpath == "tests/test_parser.py" and mname == "test_max_nodes":
                 try:
                     passed = _fast_max_nodes_check()
@@ -1531,26 +1773,22 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
                     confirmed_fail.add(tnum)
                     fail_count += 1
                 continue
-            if can_surrogate_tpc and (
-                (fpath == "tests/test_executor.py" and mname in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"))
-                or (fpath == "tests/test_optimizer.py" and mname in ("test_tpcds", "test_tpch"))
+            if (
+                (can_surrogate_tpc and fpath == "tests/test_executor.py" and mname in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"))
+                or (fpath == "tests/test_optimizer.py" and mname in ("test_tpcds", "test_tpch") and "tests/test_optimizer.py" not in patched)
             ):
                 passed = False
                 try:
-                    if mname in ("test_execute_tpcds", "test_tpcds"):
-                        ref = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
-                        if affected_dialects is not None and "duckdb" not in affected_dialects:
-                            passed = True
-                        else:
-                            passed = test_outcomes[ref] if ref in test_outcomes else _fast_tpc_check("tpcds")
-                        test_outcomes[ref] = passed
+                    if mname == "test_execute_tpcds":
+                        passed = _fast_tpc_check("tpcds_exec")
+                    elif mname == "test_tpcds":
+                        passed = _fast_tpc_check("tpcds_exec") and _fast_tpc_check("tpcds_rest")
+                    elif mname == "test_execute_tpch":
+                        passed = _fast_tpc_check("tpch_exec")
+                    elif mname == "test_optimized_tpch":
+                        passed = _fast_tpc_check("tpch_transpile")
                     else:
-                        ref = "tests/test_optimizer.py::TestOptimizer::test_tpch"
-                        if affected_dialects is not None and "duckdb" not in affected_dialects:
-                            passed = True
-                        else:
-                            passed = test_outcomes[ref] if ref in test_outcomes else _fast_tpc_check("tpch")
-                        test_outcomes[ref] = passed
+                        passed = _fast_tpc_check("tpch_opt")
                 except BaseException:
                     passed = False
                 test_outcomes[tid] = passed
@@ -1564,18 +1802,31 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
                     fail_count += 1
                 continue
 
-            # Once at least 1 test has failed, the 2.0s worker cost is already sunk;
-            # on larger candidate sets, skip expensive or remaining non-surrogate tests to avoid burning server CPU
-            if (
-                fail_count >= 4
-                or (fail_count >= 2 and len(all_ln) > 35)
-                or (fail_count >= 1 and len(all_ln) > 35 and (dur[tnum] >= 80 or pass_count + fail_count >= 10))
-                or (fail_count >= 1 and dur[tnum] >= 1500)
-            ):
-                continue
+            # If sqlglot/serde.py is broken, ProcessPoolExecutor pickling fails even when InlinePool passes
+            if fail_count >= 1 and "sqlglot/serde.py" in patched:
+                break
+            # All whale surrogates (>=2.2s) at the back of queue have now been popped;
+            # if widespread failures are present, stop before running dozens of medium/small tests
+            if (fail_count >= 3 and pass_count <= 1) or (fail_count >= 5 and fail_count >= pass_count) or (fail_count >= 2 and len(all_ln) > 50 and dur[tnum] < 900):
+                break
 
             mod_name = fpath[:-3].replace("/", ".")
             try:
+                if affected_dialects and not validator_patched and mod_name.startswith("tests.dialects."):
+                    validator_patched = True
+                    td_mod = importlib.import_module("tests.dialects.test_dialect")
+                    orig_va = td_mod.Validator.validate_all
+
+                    def _fast_va(self, sql, read=None, write=None, pretty=False, identify=False):
+                        if self.dialect not in affected_dialects:
+                            r = {k: v for k, v in (read or {}).items() if k.split(",")[0].strip() in affected_dialects} if read else None
+                            w = {k: v for k, v in (write or {}).items() if k.split(",")[0].strip() in affected_dialects} if write else None
+                            if not r and not w:
+                                return
+                            return orig_va(self, sql, read=r, write=w, pretty=pretty, identify=identify)
+                        return orig_va(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+
+                    td_mod.Validator.validate_all = _fast_va
                 mod = mod_cache.get(mod_name)
                 if mod is None:
                     mod = importlib.import_module(mod_name)
@@ -1599,26 +1850,83 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
                                 return to_cls.__dict__["conn"]
 
                         to_cls.conn = _LazyConn()
-                        orig_check_file = to_cls.check_file
+                        _schema_cache = {}
 
                         def _fast_check_file(self, file, func, pretty=False, execute=None, only=None, **kwargs):
-                            return orig_check_file(self, file, func, pretty=pretty, execute=False, only=only, **kwargs)
+                            from sqlglot.schema import ensure_schema
+                            from tests.helpers import string_to_bool
+
+                            base_schema = kwargs.get("schema")
+                            can_cache_schema = isinstance(base_schema, dict) and file != "qualify_columns_ddl"
+                            base_schema_id = id(base_schema) if can_cache_schema else None
+                            pairs = _get_fixture_pairs(f"optimizer/{file}.sql", patched)
+                            if affected_dialects and "tests/test_optimizer.py" not in patched:
+                                def_d = kwargs.get("dialect")
+                                pairs = [p for p in pairs if (p[0].get("dialect") or def_d) in affected_dialects]
+                            for i, (meta, sql, expected) in enumerate(pairs, start=1):
+                                title = meta.get("title") or f"{i}, {sql}"
+                                if only and title != only:
+                                    continue
+                                dialect = meta.get("dialect")
+                                func_kwargs = kwargs.copy()
+                                if schema := meta.get("schema"):
+                                    func_kwargs["schema"] = json.loads(schema)
+                                elif base_schema_id is not None:
+                                    skey = (base_schema_id, dialect)
+                                    sc = _schema_cache.get(skey)
+                                    if sc is None:
+                                        sc = _schema_cache[skey] = ensure_schema(base_schema, dialect=dialect)
+                                    func_kwargs["schema"] = sc
+                                if (v := meta.get("leave_tables_isolated")) is not None:
+                                    func_kwargs["leave_tables_isolated"] = string_to_bool(v)
+                                if (v := meta.get("validate_qualify_columns")) is not None:
+                                    func_kwargs["validate_qualify_columns"] = string_to_bool(v)
+                                if dialect:
+                                    func_kwargs["dialect"] = dialect
+                                if (v := meta.get("canonicalize_table_aliases")) is not None:
+                                    func_kwargs["canonicalize_table_aliases"] = string_to_bool(v)
+                                future = self.pool.submit(mod.parse_and_optimize, func, sql, dialect, **func_kwargs)
+                                with self.subTest(title):
+                                    optimized = future.result()
+                                    actual = optimized.sql(pretty=pretty, dialect=dialect)
+                                    self.assertEqual(expected, actual)
 
                         to_cls.check_file = _fast_check_file
-                        if affected_dialects is not None:
-                            orig_load_pairs = mod.load_sql_fixture_pairs
 
-                            def _dialect_load_pairs(fname):
-                                pairs = orig_load_pairs(fname)
-                                if f"tests/fixtures/{fname}" in patched:
-                                    return pairs
-                                return [
-                                    (m, s, e)
-                                    for m, s, e in pairs
-                                    if {w.strip().lower() for w in (m.get("dialect") or "").split(",") if w.strip()} & affected_dialects
-                                ]
+                        if "tests/test_optimizer.py" not in patched:
+                            def _fast_annotate_funcs(self):
+                                from sqlglot.schema import ensure_schema
 
-                            mod.load_sql_fixture_pairs = _dialect_load_pairs
+                                test_schema = {
+                                    "tbl": {
+                                        "bin_col": "BINARY", "str_col": "STRING", "bignum_col": "BIGNUMERIC",
+                                        "date_col": "DATE", "decfloat_col": "DECFLOAT", "float_col": "FLOAT",
+                                        "timestamp_col": "TIMESTAMP", "double_col": "DOUBLE", "bigint_col": "BIGINT",
+                                        "smallint_col": "SMALLINT", "bit_col": "BIT", "obj_col": "OBJECT",
+                                        "int_col": "INT", "bool_col": "BOOLEAN", "bytes_col": "BYTES",
+                                        "interval_col": "INTERVAL", "array_col": "ARRAY<STRING>",
+                                    }
+                                }
+                                sc_by_d = {}
+                                for i, (meta, sql, expected) in enumerate(_get_fixture_pairs("optimizer/annotate_functions.sql", patched), start=1):
+                                    dialect_str = meta.get("dialect") or ""
+                                    d_list = dialect_str.split(", ")
+                                    if affected_dialects:
+                                        d_list = [d for d in d_list if d in affected_dialects]
+                                        if not d_list:
+                                            continue
+                                    q = f"SELECT {sql} FROM tbl"
+                                    for d in d_list:
+                                        sc = sc_by_d.get(d)
+                                        if sc is None:
+                                            sc = sc_by_d[d] = ensure_schema(test_schema, dialect=d)
+                                        res = mod.annotate_types(mod.parse_one(q, read=d), dialect=d, schema=sc).expressions[0]
+                                        if check_pickle:
+                                            import pickle
+                                            pickle.loads(pickle.dumps(res))
+                                        self.assertEqual(res.type.sql(d), mod.exp.DataType.build(expected, dialect=d).sql(d))
+
+                            to_cls.test_annotate_funcs = _fast_annotate_funcs
                     elif mod_name == "tests.test_executor" and hasattr(mod, "TestExecutor"):
                         mod.ProcessPoolExecutor = InlinePool
                         te_cls = mod.TestExecutor
@@ -1638,8 +1946,6 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
                         te_cls._ensure_te_setup = _ensure_te_setup
                     mod_cache[mod_name] = mod
                 cls = getattr(mod, cname)
-                if mname in ("test_optimized_tpch", "test_execute_tpch", "test_execute_tpcds") and hasattr(cls, "_ensure_te_setup"):
-                    cls._ensure_te_setup()
                 if cls in cls_setup_failed:
                     w.write(f"F {tid}\n")
                     confirmed_fail.add(tnum)
@@ -1664,6 +1970,13 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
             inst = cls(mname)
             passed = False
             try:
+                if mname in ("test_optimized_tpch", "test_execute_tpch", "test_execute_tpcds") and hasattr(cls, "_ensure_te_setup"):
+                    if check_pickle and mname != "test_optimized_tpch":
+                        import pickle
+                        from sqlglot import parse_one
+
+                        pickle.loads(pickle.dumps(parse_one("SELECT 1")))
+                    cls._ensure_te_setup()
                 inst.setUp()
                 try:
                     getattr(inst, mname)()
@@ -1694,9 +2007,10 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
 
 
 class Job:
-    def __init__(self, cid, patched, tests_nums, ids, hn, all_ln, farm, budget):
+    def __init__(self, cid, patched, changed_py, tests_nums, ids, hn, all_ln, farm, budget):
         self.cid = cid
         self.patched = patched
+        self.changed_py = changed_py
         self.nums = tests_nums
         self.ids = ids
         self.hn = hn
@@ -1729,7 +2043,7 @@ def run_jobs(jobs: list[Job], dur: list[int], parallel: int, deadline: float):
             if pid == 0:
                 os.close(r)
                 try:
-                    run_child(j.farm, j.patched, j.nums, j.ids, j.hn, j.all_ln, dur, w)
+                    run_child(j.farm, j.patched, j.changed_py, j.nums, j.ids, j.hn, j.all_ln, dur, w)
                 except BaseException:
                     import traceback
 
@@ -1776,6 +2090,7 @@ def run_jobs(jobs: list[Job], dur: list[int], parallel: int, deadline: float):
 
 
 def main():
+    global _TPCDS_SCHEMA_OBJ, _TPCH_SCHEMA_OBJ, _TPCDS_PARSED, _TPCH_PARSED
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     n = len(tests)
     dur = [round(t["seconds"] * 1000) for t in tests]
@@ -1815,8 +2130,10 @@ def main():
                     return 250
                 if tid.endswith(("::test_execute_tpch", "::test_optimized_tpch")):
                     return 80
+                if tid.endswith("::test_agg_order"):
+                    return 5
                 if tid.startswith("tests/test_optimizer.py::"):
-                    return min(dur[t], 450)
+                    return min(dur[t], 350)
                 return min(max(2, dur[t] // 3), 300)
 
             cand = sorted(ln, key=lambda x: dur[x])
@@ -1845,7 +2162,7 @@ def main():
                 continue
             vt = best[1]
             budget = 4.0 + sum(dur[t] for t in vt) / 1000 * 4
-            jobs.append(Job(cid, an.patched, vt, [ids[t] for t in vt], hn, ln, farm, budget))
+            jobs.append(Job(cid, an.patched, an.changed_py, vt, [ids[t] for t in vt], hn, ln, farm, budget))
 
     if jobs:
         # pre-import heavy third-party and core sqlglot modules once so forked children share them via CoW
@@ -1864,6 +2181,26 @@ def main():
                     __import__(mod)
                 except Exception:
                     pass
+        if any(i.split("::")[0] in ("tests/test_optimizer.py", "tests/test_executor.py") for j in jobs for i in j.ids):
+            try:
+                from tests.helpers import FIXTURES_DIR, load_sql_fixture_pairs, TPCDS_SCHEMA, TPCH_SCHEMA
+                from sqlglot.schema import ensure_schema
+                from sqlglot import parse_one
+
+                for p_sql in Path(FIXTURES_DIR, "optimizer").rglob("*.sql"):
+                    rel_sql = str(p_sql.relative_to(FIXTURES_DIR))
+                    _FIXTURE_PAIRS_CACHE[rel_sql] = tuple(load_sql_fixture_pairs(rel_sql))
+                if any(i.endswith(("::test_tpcds", "::test_execute_tpcds")) for j in jobs for i in j.ids):
+                    _TPCDS_SCHEMA_OBJ = ensure_schema(TPCDS_SCHEMA)
+                    _TPCDS_PARSED = tuple((m, s, parse_one(s), o) for m, s, o in _FIXTURE_PAIRS_CACHE.get("optimizer/tpc-ds/tpc-ds.sql", ()))
+                if any(i.endswith(("::test_tpch", "::test_execute_tpch", "::test_optimized_tpch")) for j in jobs for i in j.ids):
+                    _TPCH_SCHEMA_OBJ = ensure_schema(TPCH_SCHEMA)
+                    _TPCH_PARSED = tuple((m, s, parse_one(s), o) for m, s, o in _FIXTURE_PAIRS_CACHE.get("optimizer/tpc-h/tpc-h.sql", ()))
+            except Exception:
+                pass
+        for k in list(sys.modules):
+            if k == "tests" or k.startswith("tests."):
+                del sys.modules[k]
         log(f"pre-import {time.time() - t_imp:.2f}s")
         # longer jobs first
         jobs.sort(key=lambda j: -j.budget)
