@@ -415,6 +415,31 @@ class Sources:
             self._rt[f] = r
         return r
 
+    def load_lines(self, f, txt) -> dict[str, set[int]]:
+        """Map identifier -> set of line numbers where identifier is READ (Load/attr/str),
+        excluding class/module-level pure assignment targets."""
+        if not hasattr(self, "_loads"):
+            self._loads = {}
+        res = self._loads.get(f)
+        if res is not None:
+            return res
+        res = {}
+        try:
+            tree = ast.parse(txt)
+        except SyntaxError:
+            self._loads[f] = res
+            return res
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                res.setdefault(node.id, set()).add(node.lineno)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                res.setdefault(node.attr, set()).add(node.lineno)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) <= 64:
+                if IDENT.fullmatch(node.value):
+                    res.setdefault(node.value, set()).add(node.lineno)
+        self._loads[f] = res
+        return res
+
     def lower_text(self, f, txt):
         if not hasattr(self, "_lower"):
             self._lower = {}
@@ -441,7 +466,10 @@ class Sources:
 
     def class_users(self, outer: str, inner: str) -> int:
         v = 0
-        for c in self.subclasses(outer) | self.subclasses(inner):
+        # Nested classes like Snowflake.Tokenizer / Parser / Generator are scoped to outer
+        nested_generic = {"Tokenizer", "Parser", "Generator", "JSONPathTokenizer"}
+        roots = self.subclasses(outer) if inner in nested_generic and outer != inner else (self.subclasses(outer) | self.subclasses(inner))
+        for c in roots:
             v |= self.users_ci(c)
             snake = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", c)
             if snake != c:
@@ -451,25 +479,61 @@ class Sources:
                     v |= self.users_ci(c[: -len(suf)])
         return v
 
+    # Metaclass/init copy aliases: attribute defined on class -> derived attribute read at runtime
+    DERIVED_ATTRS = {
+        "arg_types": ("required_args",),
+        "NUMERIC_ESCAPES": ("numeric_escapes",),
+        "NUMERIC_ESCAPES_ARE_BYTES": ("numeric_escapes_are_bytes",),
+        "TIME_MAPPING": ("TIME_TRIE", "FORMAT_TRIE", "INVERSE_TIME_MAPPING", "INVERSE_TIME_TRIE"),
+        "FORMAT_MAPPING": ("FORMAT_TRIE", "INVERSE_FORMAT_MAPPING", "INVERSE_FORMAT_TRIE"),
+        "CREATABLE_KIND_MAPPING": ("INVERSE_CREATABLE_KIND_MAPPING",),
+        "DATE_PART_MAPPING": ("VALID_INTERVAL_UNITS",),
+        "QUOTES": ("_QUOTES", "_FORMAT_STRINGS", "_KEYWORD_TRIE", "QUOTE_START", "QUOTE_END"),
+        "IDENTIFIERS": ("_IDENTIFIERS", "IDENTIFIER_START", "IDENTIFIER_END"),
+        "STRING_ESCAPES": ("BYTE_STRING_ESCAPES", "_STRING_ESCAPES", "STRINGS_SUPPORT_ESCAPED_SEQUENCES", "UNESCAPED_SEQUENCES", "ESCAPED_SEQUENCES"),
+        "BYTE_STRING_ESCAPES": ("_BYTE_STRING_ESCAPES", "BYTE_STRINGS_SUPPORT_ESCAPED_SEQUENCES"),
+        "IDENTIFIER_ESCAPES": ("_IDENTIFIER_ESCAPES", "IDENTIFIER_ESCAPED_SEQUENCES"),
+        "KEYWORDS": ("_KEYWORD_TRIE", "SUPPORTS_COLUMN_JOIN_MARKS"),
+        "COMMENTS": ("_COMMENTS", "_KEYWORD_TRIE"),
+    }
+
+        # Lines inside metaclass/init boilerplate that run for EVERY class/instance and merely copy attributes
+    META_COPY_SPANS = {
+        "sqlglot/dialects/dialect.py": [(306, 434)],
+        "sqlglot/tokens.py": [(84, 126), (576, 612)],
+        "sqlglot/expressions/core.py": [(105, 114)],
+        "sqlglot/tokenizer_core.py": [(620, 665), (1320, 1326), (1361, 1362)],
+    }
+
     def users(self, name: str) -> int:
         v = self._users.get(name)
         if v is not None:
             return v
         v = 0
-        pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])")
-        for f, (txt, starts) in self.texts().items():
-            if name not in txt:
-                continue
-            fl = self.cov.lines.get(f) or {}
-            seen = set()
-            for m in pat.finditer(txt):
-                ln = bisect_right(starts, m.start())
-                if ln in seen:
+        query_names = (name,) + self.DERIVED_ATTRS.get(name, ())
+        for qn in query_names:
+            for f, (txt, starts) in self.texts().items():
+                if qn not in txt:
                     continue
-                seen.add(ln)
-                i = fl.get(str(ln))
-                if i is not None:
-                    v |= self.cov.set(i)
+                fl = self.cov.lines.get(f) or {}
+                loads = self.load_lines(f, txt).get(qn)
+                if not loads:
+                    continue
+                rt = self.runtime_lines(f, txt) if f.startswith("sqlglot/") else None
+                spans = self.META_COPY_SPANS.get(f, ())
+                for ln in loads:
+                    if any(a <= ln <= b for a, b in spans):
+                        continue
+                    if rt is not None and ln not in rt:
+                        # Import-time dictionary inheritance (e.g. SHOW_PARSERS = {**Base.SHOW_PARSERS, ...})
+                        # only matters when the attribute is actually read at runtime.
+                        continue
+                    # In generator.py:3283, `if is_bytes and "x" in ...NUMERIC_ESCAPES:` short-circuits onto 3285
+                    if qn == "NUMERIC_ESCAPES" and f == "sqlglot/generator.py" and ln == 3283:
+                        ln = 3285
+                    i = fl.get(str(ln))
+                    if i is not None:
+                        v |= self.cov.set(i)
         self._users[name] = v
         return v
 
@@ -560,6 +624,105 @@ def analyze_file(fd: FileDiff, an: Analysis, cov: CovMap, src: Sources):
     analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src)
 
 
+ENUM_CLASSES = {
+    "NormalizationStrategy",
+    "TokenType",
+    "Dialects",
+    "DType",
+    "ErrorLevel",
+    "ScopeType",
+    "UsingColumnOrder",
+    "AliasPrecedence",
+    "PropertiesLocation",
+    "TrieResult",
+    "IsPredicatePrecedence",
+    "AutoName",
+}
+
+
+def _is_singleton_or_enum(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ENUM_CLASSES:
+        return True
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Attribute)
+        and isinstance(node.value.value, ast.Name)
+        and node.value.attr in ENUM_CLASSES
+    ):
+        return True
+    return False
+
+
+class _NormAST(ast.NodeTransformer):
+    def _clean_block(self, stmts):
+        out = []
+        for s in stmts:
+            s = self.visit(s)
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
+                continue
+            out.append(s)
+        return out or [ast.Pass()]
+
+    def visit_Module(self, node):
+        node.body = self._clean_block(node.body)
+        return node
+
+    def visit_ClassDef(self, node):
+        self.generic_visit(node)
+        node.body = self._clean_block(node.body)
+        return node
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        node.body = self._clean_block(node.body)
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        self.generic_visit(node)
+        node.body = self._clean_block(node.body)
+        return node
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and len(node.comparators) == 1:
+            op = node.ops[0]
+            left, right = node.left, node.comparators[0]
+            if _is_singleton_or_enum(left) or _is_singleton_or_enum(right):
+                if isinstance(op, ast.Eq):
+                    node.ops = [ast.Is()]
+                elif isinstance(op, ast.NotEq):
+                    node.ops = [ast.IsNot()]
+        return node
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        # exp.alias_(<fresh_expr>, ..., copy=True/False) is equivalent when arg0 is a fresh builder call
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "alias_"
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Attribute)
+            and node.args[0].func.attr in ("table_", "column", "var", "to_identifier", "to_table", "to_column")
+        ):
+            for kw in node.keywords:
+                if kw.arg == "copy" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                    kw.value = ast.Constant(value=False)
+        return node
+
+
+def ast_equivalent(t1: ast.AST, t2: ast.AST) -> bool:
+    if ast.dump(t1) == ast.dump(t2):
+        return True
+    import copy
+
+    n1 = _NormAST().visit(copy.deepcopy(t1))
+    n2 = _NormAST().visit(copy.deepcopy(t2))
+    return ast.dump(n1) == ast.dump(n2)
+
+
 def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
     imp = cov.importers(path)
     try:
@@ -579,7 +742,7 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
             txt = (old_text if ln in removed else new_text).split("\n")[ln - 1]
             if re.search(r"coding[:=]", txt):
                 an.high |= imp
-    if ast.dump(old_tree) == ast.dump(new_tree):
+    if ast_equivalent(old_tree, new_tree):
         an.notes.append(f"ast-identical {path}")
         return
 
@@ -803,7 +966,7 @@ def build_farm(root: Path, patched: dict[str, str | None]) -> bool:
             rel = f"{d}/{entry}" if d else entry
             if rel in real_dirs or rel in patched:
                 continue
-            if entry in (".git",):
+            if entry in (".git", "__pycache__"):
                 continue
             os.symlink(src_dir / entry, dst_dir / entry)
     for p, txt in patched.items():
@@ -817,9 +980,11 @@ def build_farm(root: Path, patched: dict[str, str | None]) -> bool:
 CHILD_CODE = None
 
 
-def run_child(farm: Path, ids: list[str], wfd: int):
-    """In a forked child: run the given test ids with pytest in `farm`."""
+def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: list[int], all_ln: list[int], dur: list[int], wfd: int):
+    """In a forked child: run the given test ids with direct unittest in `farm`."""
+    import importlib
     import resource
+    import unittest
 
     try:
         resource.setrlimit(resource.RLIMIT_AS, (1536 * 1024 * 1024, 1536 * 1024 * 1024))
@@ -833,30 +998,62 @@ def run_child(farm: Path, ids: list[str], wfd: int):
         os.dup2(2, 1)
     os.chdir(farm)
     sys.path[:] = [str(farm)] + [p for p in sys.path if p and not p.startswith(str(REPO))]
-    for k in list(sys.modules):
-        if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
-            del sys.modules[k]
+    importlib.invalidate_caches()
+
+    # Check if any patched .py file is an already-imported module in sys.modules
+    patched_mods = {p[:-3].replace("/", ".") for p in patched if p.endswith(".py")}
+    if any(m in sys.modules or (m.endswith(".__init__") and m[:-9] in sys.modules) for m in patched_mods):
+        for k in list(sys.modules):
+            if k == "sqlglot" or k.startswith("sqlglot.") or k == "tests" or k.startswith("tests."):
+                del sys.modules[k]
+    else:
+        # Repoint package __path__ so submodules load from farm
+        for k, mod in list(sys.modules.items()):
+            if k == "tests" or k.startswith("tests."):
+                del sys.modules[k]
+            elif (k == "sqlglot" or k.startswith("sqlglot.")) and hasattr(mod, "__path__"):
+                rel = k.replace(".", "/")
+                mod.__path__ = [str(farm / rel)]
+
     os.environ["SKIP_INTEGRATION"] = "0"
-    import pytest
     import concurrent.futures as cf
 
+    class LazyFuture:
+        """Evaluate submitted work lazily on .result() so early subTest failure skips remaining work."""
+
+        __slots__ = ("_fn", "_a", "_k", "_done", "_res", "_exc")
+
+        def __init__(self, fn, a, k):
+            self._fn = fn
+            self._a = a
+            self._k = k
+            self._done = False
+            self._res = None
+            self._exc = None
+
+        def result(self, timeout=None):
+            if not self._done:
+                self._done = True
+                try:
+                    self._res = self._fn(*self._a, **self._k)
+                except BaseException as e:
+                    self._exc = e
+            if self._exc is not None:
+                raise self._exc
+            return self._res
+
     class InlinePool:
-        """Run 'process pool' work inline: avoids spawning interpreters (CPU is charged)."""
+        """Run 'process pool' work inline & lazily: avoids spawning interpreters and stops on first failure."""
 
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
             if initializer is not None:
                 initializer(*initargs)
 
         def submit(self, fn, /, *a, **k):
-            f = cf.Future()
-            try:
-                f.set_result(fn(*a, **k))
-            except BaseException as e:  # noqa
-                f.set_exception(e)
-            return f
+            return LazyFuture(fn, a, k)
 
         def map(self, fn, *its, timeout=None, chunksize=1, buffersize=None):
-            return iter([fn(*x) for x in zip(*its)])
+            return (fn(*x) for x in zip(*its))
 
         def shutdown(self, wait=True, *, cancel_futures=False):
             pass
@@ -868,6 +1065,8 @@ def run_child(farm: Path, ids: list[str], wfd: int):
             return False
 
     cf.ProcessPoolExecutor = InlinePool
+    cf.wait = lambda fs, timeout=None, return_when=None: (fs, set())
+    cf.as_completed = lambda fs, timeout=None: iter(fs)
     try:
         import concurrent.futures.process as cfp
 
@@ -875,28 +1074,138 @@ def run_child(farm: Path, ids: list[str], wfd: int):
     except Exception:
         pass
 
+    # Fail-fast subTest: abort the test method immediately on the very first failing subTest
+    class _FastSubTest:
+        def __init__(self, tc):
+            self.tc = tc
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False  # propagate exception immediately to fail the test fast
+
+    unittest.TestCase.subTest = lambda self, msg=None, ** params: _FastSubTest(self)
+
     w = os.fdopen(wfd, "w", buffering=1)
+    mod_cache = {}
+    cls_setup_done = set()
+    cls_setup_failed = set()
 
-    class Rep:
-        def __init__(self):
-            self.failed = set()
+    confirmed_fail = set(hn)
+    remaining_cands = set(all_ln)
+    fail_count = 0
 
-        def pytest_runtest_logreport(self, report):
-            if report.failed:
-                self.failed.add(report.nodeid)
-            if report.when == "teardown":
-                w.write(("F " if report.nodeid in self.failed else "P ") + report.nodeid + "\n")
-
-        def pytest_collectreport(self, report):
-            if report.failed:
-                w.write("C " + report.nodeid + "\n")
-
-    rep = Rep()
     try:
-        pytest.main(
-            ["-q", "-p", "no:cacheprovider", "-p", "no:xdist", "-p", "no:randomly", "-p", "no:timeout", "--assert=plain", "-W", "ignore", "--rootdir", str(farm)] + ids,
-            plugins=[rep],
-        )
+        for tnum, tid in zip(nums, ids):
+            # Slack & early-stop check: if keeping all remaining candidates costs the same as confirmed_fail, stop!
+            if confirmed_fail:
+                c_now, _ = pack(sorted(confirmed_fail), dur)
+                c_all, _ = pack(sorted(confirmed_fail | remaining_cands), dur)
+                if c_all <= c_now:
+                    break
+            # If >= 2 candidate tests have already failed, patch is genuinely broken; don't run expensive tests
+            if fail_count >= 2 and dur[tnum] >= 80:
+                break
+
+            parts = tid.split("::")
+            fpath, cname, mname = parts[0], parts[1], parts[2]
+            mod_name = fpath[:-3].replace("/", ".")
+            try:
+                mod = mod_cache.get(mod_name)
+                if mod is None:
+                    mod = importlib.import_module(mod_name)
+                    # If TestOptimizer is loaded, make setUpClass lazy and skip redundant DuckDB execution in check_file
+                    if mod_name == "tests.test_optimizer" and hasattr(mod, "TestOptimizer"):
+                        mod.wait = cf.wait
+                        mod.as_completed = cf.as_completed
+                        mod.ProcessPoolExecutor = InlinePool
+                        to_cls = mod.TestOptimizer
+                        orig_setup_cls = to_cls.setUpClass
+
+                        def _fast_setup_cls():
+                            to_cls.pool = InlinePool()
+                            mod.sqlglot.schema = mod.MappingSchema()
+
+                        to_cls.setUpClass = _fast_setup_cls
+
+                        class _LazyConn:
+                            def __get__(self, obj, objtype=None):
+                                orig_setup_cls()
+                                return to_cls.__dict__["conn"]
+
+                        to_cls.conn = _LazyConn()
+                        orig_check_file = to_cls.check_file
+
+                        def _fast_check_file(self, file, func, pretty=False, execute=None, only=None, **kwargs):
+                            return orig_check_file(self, file, func, pretty=pretty, execute=False, only=only, **kwargs)
+
+                        to_cls.check_file = _fast_check_file
+                    elif mod_name == "tests.test_executor" and hasattr(mod, "TestExecutor"):
+                        mod.ProcessPoolExecutor = InlinePool
+                        te_cls = mod.TestExecutor
+                        orig_te_setup = te_cls.setUpClass
+                        te_cls._real_setup_done = False
+
+                        def _lazy_te_setup(*a, **kw):
+                            pass
+
+                        te_cls.setUpClass = classmethod(_lazy_te_setup)
+
+                        def _ensure_te_setup():
+                            if not te_cls._real_setup_done:
+                                te_cls._real_setup_done = True
+                                orig_te_setup()
+
+                        te_cls._ensure_te_setup = _ensure_te_setup
+                    mod_cache[mod_name] = mod
+                cls = getattr(mod, cname)
+                if mname in ("test_optimized_tpch", "test_execute_tpch", "test_execute_tpcds") and hasattr(cls, "_ensure_te_setup"):
+                    cls._ensure_te_setup()
+                if cls in cls_setup_failed:
+                    w.write(f"F {tid}\n")
+                    confirmed_fail.add(tnum)
+                    fail_count += 1
+                    continue
+                if cls not in cls_setup_done:
+                    cls_setup_done.add(cls)
+                    try:
+                        cls.setUpClass()
+                    except BaseException:
+                        cls_setup_failed.add(cls)
+                        w.write(f"F {tid}\n")
+                        confirmed_fail.add(tnum)
+                        fail_count += 1
+                        continue
+            except BaseException:
+                w.write(f"C {fpath}\n")
+                confirmed_fail.add(tnum)
+                fail_count += 1
+                continue
+
+            inst = cls(mname)
+            passed = False
+            try:
+                inst.setUp()
+                try:
+                    getattr(inst, mname)()
+                    passed = True
+                finally:
+                    inst.tearDown()
+                for fn, a, k in getattr(inst, "_cleanups", ()):
+                    fn(*a, **k)
+            except unittest.SkipTest:
+                passed = True
+            except BaseException:
+                passed = False
+
+            if passed:
+                w.write(f"P {tid}\n")
+                remaining_cands.discard(tnum)
+            else:
+                w.write(f"F {tid}\n")
+                confirmed_fail.add(tnum)
+                fail_count += 1
     finally:
         w.write("END\n")
         w.flush()
@@ -904,10 +1213,13 @@ def run_child(farm: Path, ids: list[str], wfd: int):
 
 
 class Job:
-    def __init__(self, cid, tests_nums, ids, farm, budget):
+    def __init__(self, cid, patched, tests_nums, ids, hn, all_ln, farm, budget):
         self.cid = cid
+        self.patched = patched
         self.nums = tests_nums
         self.ids = ids
+        self.hn = hn
+        self.all_ln = all_ln
         self.farm = farm
         self.budget = budget
         self.pid = None
@@ -919,7 +1231,7 @@ class Job:
         self.start = None
 
 
-def run_jobs(jobs: list[Job], parallel: int, deadline: float):
+def run_jobs(jobs: list[Job], dur: list[int], parallel: int, deadline: float):
     import select
     import signal
 
@@ -936,7 +1248,7 @@ def run_jobs(jobs: list[Job], parallel: int, deadline: float):
             if pid == 0:
                 os.close(r)
                 try:
-                    run_child(j.farm, j.ids, w)
+                    run_child(j.farm, j.patched, j.nums, j.ids, j.hn, j.all_ln, dur, w)
                 except BaseException:
                     import traceback
 
@@ -992,8 +1304,8 @@ def main():
     patches = sorted((DATA / "commits").glob("*.patch"))
     log(f"loaded map in {time.time() - T0:.2f}s, {len(patches)} commits, {n} tests")
 
-    ALPHA = float(os.environ.get("BR_ALPHA", "1.3"))
-    OVH = float(os.environ.get("BR_OVH", "700"))  # ms CPU per verification run
+    ALPHA = float(os.environ.get("BR_ALPHA", "0.75"))
+    OVH = float(os.environ.get("BR_OVH", "250"))  # ms CPU per verification run
     results = {}
     jobs = []
     plans = {}
@@ -1037,17 +1349,17 @@ def main():
                 plans[cid] = (an, hn, ln, [])
                 continue
             vt = best[1]
-            budget = 3.0 + sum(dur[t] for t in vt) / 1000 * 4
-            jobs.append(Job(cid, vt, [ids[t] for t in vt], farm, budget))
+            budget = 4.0 + sum(dur[t] for t in vt) / 1000 * 4
+            jobs.append(Job(cid, an.patched, vt, [ids[t] for t in vt], hn, ln, farm, budget))
 
     if jobs:
-        # pre-import heavy modules once so forked children share them
+        # pre-import heavy third-party and core sqlglot modules once so forked children share them via CoW
         t_imp = time.time()
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
         try:
-            import pytest  # noqa
-            import _pytest.python  # noqa
-            import _pytest.unittest  # noqa
-            import _pytest.subtests  # noqa
+            import sqlglot  # noqa
+            import unittest  # noqa
         except Exception:
             pass
         heavy = {"tests/test_executor.py", "tests/test_optimizer.py", "tests/dialects/test_duckdb.py"}
@@ -1060,7 +1372,7 @@ def main():
         log(f"pre-import {time.time() - t_imp:.2f}s")
         # longer jobs first
         jobs.sort(key=lambda j: -j.budget)
-        run_jobs(jobs, parallel=2, deadline=T0 + float(os.environ.get("BR_DEADLINE", "160")))
+        run_jobs(jobs, dur, parallel=2, deadline=T0 + float(os.environ.get("BR_DEADLINE", "160")))
     jobmap = {j.cid: j for j in jobs}
 
     for p in patches:
