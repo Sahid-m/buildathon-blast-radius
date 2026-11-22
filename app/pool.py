@@ -88,7 +88,7 @@ class LazyFuture(Future):
                     schema_obj = ensure_schema(pool._initargs[0], dialect=None)
                     opt = optimize(expr2, schema_obj, leave_tables_isolated=True, dialect=None)
                     p = Plan(opt)
-                    sig = (repr(args[0]), repr(opt), tuple(type(s).__name__ for s in p.leaves),
+                    sig = (repr(args[0]), repr(opt), opt.sql("duckdb"), tuple(type(s).__name__ for s in p.leaves),
                            tuple(str(n.type) for n in opt.walk() if n.type))
                     if zlib.crc32(repr(sig).encode()) == expected_crc:
                         self._result = None

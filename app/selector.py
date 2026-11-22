@@ -2707,8 +2707,8 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     preload.reduce_class_fixtures(changed)
             if plan.keeps and not NO_REDUCE:
                 keeps = apply_keeps(plan, MAPS_OBJ, tests)
-            if tpcds_front_ok(plan) and any(tests[n]["seconds"] > 20.0 for n in order):
-                reduce.STATE.tpcds_front = get_tpcds_front()
+        if tpcds_front_ok(plan) and any(tests[n]["seconds"] > 20.0 for n in order):
+            reduce.STATE.tpcds_front = get_tpcds_front()
         if PANDAS_USERS and any(n in PANDAS_USERS for n in order):
             import lazymods
 
@@ -3597,11 +3597,7 @@ _TPCDS_FRONT = [False]
 _TPCDS_BACK_PREFIXES = (
     "tests/test_executor.py",
     "sqlglot/executor/",
-    "sqlglot/planner.py",
     "sqlglot/generators/python.py",
-    "sqlglot/generator.py",
-    "sqlglot/generators/duckdb.py",
-    "sqlglot/expressions/core.py",
     "tests/fixtures/optimizer/tpc-ds/",
 )
 
@@ -3609,7 +3605,7 @@ _TPCDS_BACK_PREFIXES = (
 def tpcds_front_ok(plan: Plan) -> bool:
     if plan.broken or plan.all_fail:
         return False
-    return not any(p.startswith(_TPCDS_BACK_PREFIXES) for p in set(plan.files) | set(plan.infect_files))
+    return not any(p.startswith(_TPCDS_BACK_PREFIXES) for p in plan.files)
 
 
 def get_tpcds_front():
@@ -3632,7 +3628,7 @@ def get_tpcds_front():
                         e = parse_one(sql)
                         opt = optimize(e.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
                         p = SqlPlan(opt)
-                        sig = (repr(e), repr(opt), tuple(type(s).__name__ for s in p.leaves),
+                        sig = (repr(e), repr(opt), opt.sql("duckdb"), tuple(type(s).__name__ for s in p.leaves),
                                tuple(str(n.type) for n in opt.walk() if n.type))
                         front[i] = zlib.crc32(repr(sig).encode())
                 _TPCDS_FRONT[0] = front
@@ -4141,7 +4137,15 @@ def run(t_start, deadline, state):
             # On labeled mutants, a long test fails together with another test of its class
             # (or of its fixture file) in nearly every case, and almost never without one.
             # The tests of its class did run (see protect below), so their verdicts decide.
-            selected.update(n for n in held if seconds[n] <= QUIET_HOLD_SECONDS)
+            if not failing and len(verdicts) >= 15:
+                tested_cls = collections.Counter(tests[n]["id"].rsplit("::", 1)[0] for n in verdicts)
+                selected.update(
+                    n for n in held
+                    if seconds[n] <= QUIET_HOLD_SECONDS
+                    and (tested_cls[tests[n]["id"].rsplit("::", 1)[0]] < 2 or n in plan.data_cands)
+                )
+            else:
+                selected.update(n for n in held if seconds[n] <= QUIET_HOLD_SECONDS)
             # (with many failures: a commit that breaks this much can break any test)
             # (one more failure is counted when marginal_holds held tests: the first failing
             # test of the runs before that rule may be one of them)
