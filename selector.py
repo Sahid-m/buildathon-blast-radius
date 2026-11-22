@@ -395,6 +395,16 @@ class Sources:
         self._users[key] = v
         return v
 
+    def tree(self, f, txt):
+        if not hasattr(self, "_trees"):
+            self._trees = {}
+        if f not in self._trees:
+            try:
+                self._trees[f] = ast.parse(txt)
+            except SyntaxError:
+                self._trees[f] = None
+        return self._trees[f]
+
     def runtime_lines(self, f, txt):
         """Lines inside function/lambda bodies (they run only when called)."""
         if not hasattr(self, "_rt"):
@@ -402,10 +412,7 @@ class Sources:
         r = self._rt.get(f)
         if r is None:
             r = set()
-            try:
-                tree = ast.parse(txt)
-            except SyntaxError:
-                tree = None
+            tree = self.tree(f, txt)
             if tree is not None:
                 for node in ast.walk(tree):
                     if isinstance(node, FUNC):
@@ -424,9 +431,8 @@ class Sources:
         if res is not None:
             return res
         res = {}
-        try:
-            tree = ast.parse(txt)
-        except SyntaxError:
+        tree = self.tree(f, txt)
+        if tree is None:
             self._loads[f] = res
             return res
         for node in ast.walk(tree):
