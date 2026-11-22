@@ -32,6 +32,8 @@ class State:
         self.keep_changed = None
         self.changed_only = False  # True: nothing but data files changed in this commit
         self.in_test = False
+        self.tpcds_front = None  # {task_index: expected_crc32} when front check is active for test_execute_tpcds
+        self.tpcds_diffs = 0
 
     def reset(self, keep_files=None, keep_tasks=None):
         self.keep_files, self.keep_tasks = keep_files, keep_tasks
@@ -39,6 +41,7 @@ class State:
         self.task_counter = 0
         self.files_seen = {}
         self.tasks_seen = 0
+        self.tpcds_diffs = 0
 
     def enter(self, tag):
         self.current = tag

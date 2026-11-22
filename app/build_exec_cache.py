@@ -40,6 +40,25 @@ def main():
             marshal.dump((sizes, rows), f)
         os.replace(path + ".tmp", path)
         print(path, os.path.getsize(path), "bytes", file=sys.stderr)
+    import zlib
+    from sqlglot import parse_one
+    from sqlglot.optimizer import optimize
+    from sqlglot.planner import Plan
+    from sqlglot.schema import ensure_schema
+    schema_obj = ensure_schema(mod.TPCDS_SCHEMA, dialect=None)
+    front = {}
+    for i, (meta, sql, _) in enumerate(cls.tpcds_sqls):
+        if meta.get("execute"):
+            e = parse_one(sql)
+            opt = optimize(e.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
+            p = Plan(opt)
+            sig = (repr(e), repr(opt), tuple(type(s).__name__ for s in p.leaves),
+                   tuple(str(n.type) for n in opt.walk() if n.type))
+            front[i] = zlib.crc32(repr(sig).encode())
+    fpath = os.path.join(out, "tpcds_front.bin")
+    with open(fpath + ".tmp", "wb") as f:
+        marshal.dump(front, f)
+    os.replace(fpath + ".tmp", fpath)
     if not check:
         return
     preload.EXEC_CACHE = out

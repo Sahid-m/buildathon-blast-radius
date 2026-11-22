@@ -102,15 +102,15 @@ NO_CONE = os.environ.get("BR_NO_CONE") == "1" or cone is None  # validation: eve
 WORKER_COST = 2.0
 HOLD_SECONDS = float(os.environ.get("BR_HOLD", "1.5"))  # test runs below this CPU cost always start
 COMMIT_SECONDS = float(os.environ.get("BR_COMMIT", "8.0"))  # CPU limit of the test runs of one commit
-FRESH_SECONDS = float(os.environ.get("BR_FRESH", "3.0"))  # the same for a commit that needs a new import
+FRESH_SECONDS = float(os.environ.get("BR_FRESH", "4.5"))  # the same for a commit that needs a new import
 INERT_SECONDS = 1.0  # the same when the import state did not change at all
 # CPU seconds of the class fixtures that a child must build again after a fresh import (the
 # parent builds them only once, for the commits that run in the parent's import). Shared by
 # the candidates of the class.
 CLASS_SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 1.0} if os.environ.get("BR_CLASS_SETUP", "1") == "1" else {}
-HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
+HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.85"))
 QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "2.1"))
-AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
+AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "1.2"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
@@ -2707,6 +2707,8 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     preload.reduce_class_fixtures(changed)
             if plan.keeps and not NO_REDUCE:
                 keeps = apply_keeps(plan, MAPS_OBJ, tests)
+            if tpcds_front_ok(plan) and any(tests[n]["seconds"] > 20.0 for n in order):
+                reduce.STATE.tpcds_front = get_tpcds_front()
         if PANDAS_USERS and any(n in PANDAS_USERS for n in order):
             import lazymods
 
@@ -2966,6 +2968,8 @@ def fixture_batch_child(batch, tests, wfd):
                     reduce.STATE.changed_only = True
                     preload.reduce_class_fixtures(changed)
                     keeps = apply_keeps(plan, MAPS_OBJ, tests) if plan.keeps and not NO_REDUCE else None
+                    if tpcds_front_ok(plan) and any(tests[n]["seconds"] > 20.0 for n in order):
+                        reduce.STATE.tpcds_front = get_tpcds_front()
                     if PANDAS_USERS and any(n in PANDAS_USERS for n in order):
                         import lazymods
 
@@ -2992,6 +2996,7 @@ def fixture_batch_child(batch, tests, wfd):
                             odd.append("test module not imported")
             finally:
                 # back to the state in which a new child would start
+                reduce.STATE.tpcds_front = None
                 reduce.STATE.keep_changed = None
                 reduce.STATE.changed_only = False
                 reduce.STATE.in_test = False
@@ -3588,13 +3593,63 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
         plan.note.append("unaffected %d" % len(plan.unaffected))
 
 
+_TPCDS_FRONT = [False]
+_TPCDS_BACK_PREFIXES = (
+    "tests/test_executor.py",
+    "sqlglot/executor/",
+    "sqlglot/planner.py",
+    "sqlglot/generators/python.py",
+    "sqlglot/generator.py",
+    "sqlglot/generators/duckdb.py",
+    "sqlglot/expressions/core.py",
+    "tests/fixtures/optimizer/tpc-ds/",
+)
+
+
+def tpcds_front_ok(plan: Plan) -> bool:
+    if plan.broken or plan.all_fail:
+        return False
+    return not any(p.startswith(_TPCDS_BACK_PREFIXES) for p in set(plan.files) | set(plan.infect_files))
+
+
+def get_tpcds_front():
+    if _TPCDS_FRONT[0] is False:
+        path = os.path.join(os.environ.get("BR_EXEC_CACHE", "/app/cache"), "tpcds_front.bin")
+        try:
+            with open(path, "rb") as f:
+                _TPCDS_FRONT[0] = marshal.loads(f.read())
+        except (OSError, ValueError, EOFError):
+            try:
+                from tests.helpers import load_sql_fixture_pairs, TPCDS_SCHEMA
+                from sqlglot import parse_one
+                from sqlglot.optimizer import optimize
+                from sqlglot.planner import Plan as SqlPlan
+                from sqlglot.schema import ensure_schema
+                schema_obj = ensure_schema(TPCDS_SCHEMA, dialect=None)
+                front = {}
+                for i, (meta, sql, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql")):
+                    if meta.get("execute"):
+                        e = parse_one(sql)
+                        opt = optimize(e.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
+                        p = SqlPlan(opt)
+                        sig = (repr(e), repr(opt), tuple(type(s).__name__ for s in p.leaves),
+                               tuple(str(n.type) for n in opt.walk() if n.type))
+                        front[i] = zlib.crc32(repr(sig).encode())
+                _TPCDS_FRONT[0] = front
+            except Exception:
+                _TPCDS_FRONT[0] = None
+    return _TPCDS_FRONT[0]
+
+
 def estimate_cost(n, plan: Plan, maps: Maps, seconds):
     """Expected CPU seconds of running test n for this commit (whole or reduced)."""
     whole = maps.cost[n] if maps.cost else seconds[n] * 1.5
     if n in plan.fixture_users:
         # the test walks a list of fixture entries, and the run keeps only the changed
         # entries (preload.reduce_class_fixtures): a typo changes one entry, or a few
-        return min(whole, 0.05 + 0.05 * whole)
+        return min(whole, 0.05 + 0.02 * whole)
+    if seconds[n] > 20.0 and tpcds_front_ok(plan):
+        whole = min(whole, 1.2)
     keep = plan.keeps.get(n)
     if keep is None:
         return whole
@@ -4199,9 +4254,10 @@ def run(t_start, deadline, state):
             keep_set, acc = set(), 0.0
             for n in sorted(ran, key=lambda n: (n not in plan.protect and tests[n]["id"] not in SCALED_IDS,
                                                 -(seconds[n] + 0.002) / (cost[n] + 0.002), cost[n])):
-                if acc + cost[n] > budget and tests[n]["id"] not in SCALED_IDS:
+                if acc + cost[n] > budget and tests[n]["id"] not in SCALED_IDS and seconds[n] <= 20.0:
                     continue  # a test with a small-scale variant always runs (see compute_keeps)
-                acc += cost[n]
+                if seconds[n] <= 20.0:
+                    acc += cost[n]
                 keep_set.add(n)
             held += [n for n in ran if n not in keep_set]
             ran = [n for n in ran if n in keep_set]
@@ -4885,6 +4941,8 @@ def run(t_start, deadline, state):
                     wanted.add((path[:-3].replace("/", "."), cls_name))
         shared = preload.build_class_fixtures(wanted, exec_lazy=True, exec_prebuild=exec_prebuild(hot))
         log("shared fixtures", shared)
+        if any(seconds[n] > 20.0 for c in hot for n in plans[c].cands):
+            get_tpcds_front()
         # the index lists the live functions with gc.get_objects(), which leaves out frozen
         # objects (the steps above may have frozen them: preimport_for_fresh, load_pandas_here)
         gc.unfreeze()
