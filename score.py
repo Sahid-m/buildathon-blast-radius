@@ -36,18 +36,12 @@ def _reject_constant(constant_name: str) -> Any:
 
 
 def _parse_integer_literal(literal: str) -> int | float:
-    if len(literal) > LONGEST_INTEGER_LITERAL_PARSED_EXACTLY:
-        return float(literal)
-    return int(literal)
+    return float(literal) if len(literal) > LONGEST_INTEGER_LITERAL_PARSED_EXACTLY else int(literal)
 
 
 def _parse_json_line(line: str) -> Any:
     try:
-        return json.loads(
-            line,
-            parse_constant=_reject_constant,
-            parse_int=_parse_integer_literal,
-        )
+        return json.loads(line, parse_constant=_reject_constant, parse_int=_parse_integer_literal)
     except (ValueError, RecursionError) as error:
         raise _NotJson(str(error)) from error
 
@@ -113,9 +107,7 @@ def evaluate_run(stdout: bytes, tests: list[dict], answers: dict) -> dict:
     except UnicodeDecodeError:
         return _rejection("not_utf8", None)
 
-    duration_by_test_number = {
-        test["number"]: _duration_milliseconds(test["seconds"]) for test in tests
-    }
+    duration_by_test_number = {test["number"]: _duration_milliseconds(test["seconds"]) for test in tests}
     seen_commits: set[str] = set()
     missed_commits: list[str] = []
     simulated_milliseconds = 0
@@ -140,13 +132,8 @@ def evaluate_run(stdout: bytes, tests: list[dict], answers: dict) -> dict:
         if workers is None:
             return _rejection("wrong_shape", line_number)
 
-        selected_test_numbers = [
-            test_number for worker in workers for test_number in worker
-        ]
-        if any(
-            test_number not in duration_by_test_number
-            for test_number in selected_test_numbers
-        ):
+        selected_test_numbers = [test_number for worker in workers for test_number in worker]
+        if any(test_number not in duration_by_test_number for test_number in selected_test_numbers):
             return _rejection("unknown_test", line_number)
 
         distinct_test_numbers = set(selected_test_numbers)
@@ -162,9 +149,7 @@ def evaluate_run(stdout: bytes, tests: list[dict], answers: dict) -> dict:
                 sum(duration_by_test_number[test_number] for test_number in worker)
                 for worker in occupied_workers
             )
-            simulated_milliseconds += (
-                largest_load + WORKER_COST_MILLISECONDS * len(occupied_workers)
-            )
+            simulated_milliseconds += largest_load + WORKER_COST_MILLISECONDS * len(occupied_workers)
 
         if any(
             failing_test_number not in distinct_test_numbers
@@ -203,9 +188,7 @@ def _format_milliseconds(milliseconds: int) -> str:
 
 
 def _format_microseconds(microseconds: int) -> str:
-    whole_seconds = microseconds // MICROSECONDS_PER_SECOND
-    remaining_microseconds = microseconds % MICROSECONDS_PER_SECOND
-    return f"{whole_seconds}.{remaining_microseconds:06d}"
+    return f"{microseconds // MICROSECONDS_PER_SECOND}.{microseconds % MICROSECONDS_PER_SECOND:06d}"
 
 
 def _run_batch() -> int:
@@ -220,9 +203,7 @@ def _run_batch() -> int:
 
 
 def _run_report(arguments: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        description="Score one run of your program against the sample set."
-    )
+    parser = argparse.ArgumentParser(description="Score one run of your program against the sample set.")
     parser.add_argument("data_dir", type=Path, help="holds tests.json and commits/*.patch")
     parser.add_argument("answers", type=Path, help="answers.json of the sample set")
     parser.add_argument("output_file", type=Path, help="your program's saved stdout")

@@ -1,5 +1,5 @@
-IMAGE ?= blast-radius-sahid
-SAMPLE ?= $(CURDIR)/sample
+IMAGE ?= blast-radius-entry
+SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 
 # The flags the scorer runs your image with. The scorer is linux/amd64, so on
