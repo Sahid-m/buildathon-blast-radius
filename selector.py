@@ -321,6 +321,13 @@ def stmt_names(st) -> set[str]:
     elif isinstance(st, (ast.Import, ast.ImportFrom)):
         for a in st.names:
             names.add((a.asname or a.name).split(".")[0])
+    elif (
+        isinstance(st, ast.Expr)
+        and isinstance(st.value, ast.Call)
+        and isinstance(st.value.func, ast.Attribute)
+        and isinstance(st.value.func.value, ast.Name)
+    ):
+        names.add(st.value.func.value.id)
     for t in targets:
         for sub in ast.walk(t):
             if isinstance(sub, ast.Name):
@@ -405,6 +412,7 @@ class Sources:
                     continue
                 if rt is not None and ln not in rt:
                     continue  # import-time line in the library: runs for every importer
+                ln = self.SHORT_CIRCUIT_LINES.get((low.upper(), f, ln), ln)
                 i = fl.get(str(ln))
                 if i is not None:
                     v |= self.cov.set(i)
@@ -501,17 +509,23 @@ class Sources:
             lt = self._lower[f] = txt.lower()
         return lt
 
+    CLASS_PAT = re.compile(r"^\s*class\s+(\w+)\s*\(([^)]*)\)", re.M)
+
     def subclasses(self, name: str) -> set[str]:
+        if not hasattr(self, "_subc"):
+            self._subc = {}
+        cached = self._subc.get(name)
+        if cached is not None:
+            return cached
         generic = {"Tokenizer", "Parser", "Generator", "JSONPathTokenizer", "_TrinoTokenizer"}
         out = {name}
         frontier = [name]
         while frontier:
             n = frontier.pop()
-            pat = re.compile(r"^\s*class\s+(\w+)\s*\(([^)]*)\)", re.M)
             for f, (txt, _) in self.texts().items():
                 if n not in txt:
                     continue
-                for m in pat.finditer(txt):
+                for m in self.CLASS_PAT.finditer(txt):
                     cls_name = m.group(1)
                     if cls_name in generic or cls_name in out:
                         continue
@@ -519,6 +533,7 @@ class Sources:
                     if n in bases:
                         out.add(cls_name)
                         frontier.append(cls_name)
+        self._subc[name] = out
         return out
 
     CAMEL_SPLIT = re.compile(r"(?<!^)(?=[A-Z][a-z])|(?<=[a-z0-9])(?=[A-Z])")
@@ -611,6 +626,7 @@ class Sources:
         ("SUPPORTS_NTH_VALUE_FROM_MODIFIER", "sqlglot/parser.py", 9076): 9077,
         ("SUPPORTS_ORDER_BY_ALL", "sqlglot/parser.py", 5947): 5948,
         ("UNNEST_COLUMN_ONLY", "sqlglot/parser.py", 5451): 5452,
+        ("INSERT", "sqlglot/parser.py", 4208): 4209,
     }
 
     def users(self, name: str) -> int:
@@ -896,13 +912,11 @@ class _NormAST(ast.NodeTransformer):
         return node
 
 
-def ast_equivalent(t1: ast.AST, t2: ast.AST) -> bool:
+def ast_equivalent(t1: ast.AST, t2: ast.AST, old_text: str, new_text: str) -> bool:
     if ast.dump(t1) == ast.dump(t2):
         return True
-    import copy
-
-    n1 = _NormAST().visit(copy.deepcopy(t1))
-    n2 = _NormAST().visit(copy.deepcopy(t2))
+    n1 = _NormAST().visit(ast.parse(old_text))
+    n2 = _NormAST().visit(ast.parse(new_text))
     return ast.dump(n1) == ast.dump(n2)
 
 
@@ -925,7 +939,7 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
             txt = (old_text if ln in removed else new_text).split("\n")[ln - 1]
             if re.search(r"coding[:=]", txt):
                 an.high |= imp
-    if ast_equivalent(old_tree, new_tree):
+    if ast_equivalent(old_tree, new_tree, old_text, new_text):
         an.notes.append(f"ast-identical {path}")
         return
 
