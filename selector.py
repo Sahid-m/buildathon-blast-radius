@@ -367,10 +367,13 @@ class Sources:
         if getattr(self, "_fx", None) is None:
             self._fx = {}
             for f in self.cov.opens:
-                if f.endswith("/") or f.endswith(".py"):
+                if not f.startswith("tests/fixtures/") or not (f.endswith(".sql") or f.endswith(".json")):
                     continue
                 try:
-                    self._fx[f] = (self.repo / f).read_text(encoding="utf-8", errors="replace").lower()
+                    raw = (self.repo / f).read_text(encoding="utf-8", errors="replace")
+                    if f.endswith(".sql"):
+                        raw = "\n".join(line for line in raw.splitlines() if line and not line.startswith("--"))
+                    self._fx[f] = raw.lower()
                 except OSError:
                     pass
         return self._fx
@@ -494,12 +497,37 @@ class Sources:
                         res.setdefault(node.value, set()).add(ln)
 
         _add_loads(tree, allow_all_lines=(defl is None))
-        if defl is not None:
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Lambda):
-                    _add_loads(node.body, allow_all_lines=True)
         self._loads[f] = res
         return res
+
+    def test_word_users(self, word: str) -> int:
+        key = "tw:" + word.lower()
+        v = self._users.get(key)
+        if v is not None:
+            return v
+        v = 0
+        low = word.lower()
+        pat = re.compile(r"\b" + re.escape(low) + r"\b")
+        for f, (txt, starts) in self.texts().items():
+            if f.startswith("sqlglot/"):
+                continue
+            lt = self.lower_text(f, txt)
+            if low not in lt:
+                continue
+            fl = self.cov.lines.get(f) or {}
+            spans = self.META_COPY_SPANS.get(f, ())
+            for m in pat.finditer(lt):
+                ln = bisect_right(starts, m.start())
+                if any(a <= ln <= b for a, b in spans):
+                    continue
+                i = fl.get(str(ln))
+                if i is not None:
+                    v |= self.cov.set(i)
+        for f, lt in self.fixture_texts().items():
+            if low in lt and pat.search(lt):
+                v |= self.fixture_openers(f)
+        self._users[key] = v
+        return v
 
     def lower_text(self, f, txt):
         if not hasattr(self, "_lower"):
@@ -605,8 +633,9 @@ class Sources:
         "sqlglot/expressions/core.py": [(105, 114)],
         "sqlglot/tokenizer_core.py": [(620, 665), (1320, 1326), (1361, 1362)],
         "tests/dialects/test_dialect.py": [(1, 25)],
-        "tests/test_optimizer.py": [(1, 36), (110, 156)],
+        "tests/test_optimizer.py": [(1, 36), (110, 290)],
         "tests/test_executor.py": [(1, 35), (70, 130)],
+        "tests/helpers.py": [(1, 620)],
     }
 
     SHORT_CIRCUIT_LINES = {
@@ -632,6 +661,14 @@ class Sources:
     def users(self, name: str) -> int:
         v = self._users.get(name)
         if v is not None:
+            return v
+        if name == "TPCH_SCHEMA":
+            v = self.fixture_openers("tests/fixtures/optimizer/tpc-h/tpc-h.sql")
+            self._users[name] = v
+            return v
+        if name == "TPCDS_SCHEMA":
+            v = self.fixture_openers("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")
+            self._users[name] = v
             return v
         v = 0
         extra = (name.lower(),) if name.isupper() and len(name) > 3 else ()
@@ -971,13 +1008,12 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
             if isinstance(st, FUNC) and not (line < st.body[0].lineno):
                 func_i = i
         inner, blk, idx = ch[-1]
-        # lambda inside a non-function statement (e.g. class-level dict of lambdas)
+        # multi-line lambda inside a non-function statement (1-line lambdas run at import time on their single line)
         lam = None
         if func_i is None:
-            lams = lambdas_containing(inner, line)
+            lams = [l for l in lambdas_containing(inner, line) if l.lineno < l.end_lineno]
             if lams:
                 lam = max(lams, key=lambda l: l.lineno)
-                # line must be in lambda body, not the "lambda args:" part only
         if func_i is None and lam is None:
             # import-time statement
             st = inner
@@ -1024,26 +1060,51 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
                 if cu:
                     u = (u & cu) if (u & cu) else cu
             # If modifying a single entry inside a dispatch dict, also scope to users of that key/expression
-            if names & {"EXPRESSION_METADATA", "TRANSFORMS", "PROPERTIES_LOCATION", "FUNCTIONS", "FUNCTION_PARSERS", "SHOW_PARSERS", "PROPERTY_PARSERS"}:
+            str_key_dicts = {
+                "FUNCTIONS",
+                "FUNCTION_PARSERS",
+                "SHOW_PARSERS",
+                "PROPERTY_PARSERS",
+                "KEYWORDS",
+                "NO_PAREN_FUNCTIONS",
+                "NO_PAREN_FUNCTION_PARSERS",
+                "SET_PARSERS",
+                "TIME_MAPPING",
+                "FORMAT_MAPPING",
+            }
+            expr_key_dicts = {"EXPRESSION_METADATA", "TRANSFORMS", "PROPERTIES_LOCATION"}
+            if names & (str_key_dicts | expr_key_dicts):
                 val = getattr(st, "value", None)
                 for dnode in ast.walk(val) if val is not None else ():
                     if isinstance(dnode, ast.Dict):
                         for dk, dv in zip(dnode.keys, dnode.values):
                             if dk is not None and dv is not None and dk.lineno <= line <= dv.end_lineno:
-                                if isinstance(dk, ast.Attribute) and isinstance(dk.value, ast.Name) and dk.value.id == "exp":
-                                    eu = src.class_users(dk.attr, dk.attr) | src.users(dk.attr)
-                                    if eu & u & imp:
-                                        u &= eu
-                                elif isinstance(dk, ast.Constant) and isinstance(dk.value, str) and len(dk.value) >= 2:
-                                    eu = 0
+                                if (
+                                    names & expr_key_dicts
+                                    and isinstance(dk, ast.Attribute)
+                                    and isinstance(dk.value, ast.Name)
+                                    and dk.value.id == "exp"
+                                ):
+                                    eu = (
+                                        src.class_users(dk.attr, dk.attr)
+                                        | src.users(dk.attr)
+                                        | cov.id_mask("tests/test_serde.py::TestSerde::test_serde")
+                                        | cov.id_mask("tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata")
+                                    )
+                                    u &= eu
+                                elif (
+                                    names & str_key_dicts
+                                    and isinstance(dk, ast.Constant)
+                                    and isinstance(dk.value, str)
+                                    and len(dk.value) >= 2
+                                ):
+                                    eu = cov.id_mask("tests/dialects/test_dialect.py::TestDialect::test_enum") | cov.id_mask(
+                                        "tests/test_time.py::TestTime::test_canonical_time_format_vocabulary"
+                                    )
                                     for w_tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", dk.value):
                                         if len(w_tok) >= 2:
-                                            eu |= src.users_ci(w_tok)
-                                    for subn in ast.walk(dv):
-                                        if isinstance(subn, ast.Attribute) and isinstance(subn.value, ast.Name) and subn.value.id == "exp":
-                                            eu |= src.class_users(subn.attr, subn.attr) | src.users(subn.attr)
-                                    if eu & u & imp:
-                                        u &= eu
+                                            eu |= src.test_word_users(w_tok)
+                                    u &= eu
             touched |= u & imp
             an.notes.append(f"attr {path}:{line} names={sorted(names)} -> {bin(u & imp).count('1')}")
             return
@@ -1149,7 +1210,7 @@ def analyze_py(path, old_text, new_text, removed, added, new2old, an, cov, src):
     for ln in sorted(added):
         if code_line(new_lines, ln):
             handle(ln, "new")
-    if is_test_file:
+    if is_test_file and path != "tests/helpers.py" and bin(high_local).count("1") == 1:
         an.high |= high_local
         an.low |= touched & ~high_local
     else:
@@ -1335,11 +1396,47 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
     pass_count = 0
     test_outcomes: dict[str, bool] = {}
     can_surrogate_tpc = not any(
-        p.startswith(("sqlglot/serde.py", "sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/merge_subqueries.py", "sqlglot/generators/duckdb.py", "sqlglot/dialects/duckdb.py", "tests/test_executor.py"))
+        p.startswith(("sqlglot/serde.py", "sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/merge_subqueries.py", "sqlglot/generators/duckdb.py", "sqlglot/dialects/duckdb.py", "tests/test_executor.py", "tests/test_optimizer.py", "tests/fixtures/optimizer/tpc-"))
         for p in patched
     )
     can_surrogate_max_nodes = "tests/test_parser.py" not in patched
     can_surrogate_gen_mem = not any(p in ("tests/test_generator.py", "sqlglot/generator.py", "sqlglot/dialects/dialect.py") for p in patched)
+
+    dialect_deps = {
+        "hive": ("athena", "databricks", "dune", "presto", "spark", "spark2", "trino"),
+        "mysql": ("athena", "doris", "drill", "dune", "presto", "singlestore", "starrocks", "trino"),
+        "postgres": ("materialize", "redshift", "risingwave"),
+        "presto": ("athena", "dune", "trino"),
+        "spark": ("databricks",),
+        "spark2": ("databricks", "spark"),
+        "trino": ("athena", "dune"),
+        "tsql": ("fabric",),
+    }
+    py_patched = [p for p in patched if p.endswith(".py")]
+    affected_dialects: set[str] | None = set() if py_patched else None
+    patched_stems: set[str] = set()
+    for p in py_patched:
+        stem = Path(p).stem.lower()
+        patched_stems.add(stem)
+        m_d = re.match(r"^sqlglot/(?:dialects|parsers|generators|typing)/(\w+)\.py$", p)
+        if m_d and m_d.group(1) not in ("__init__", "dialect", "base") and affected_dialects is not None:
+            d_name = m_d.group(1).lower()
+            affected_dialects.add(d_name)
+            affected_dialects.update(dialect_deps.get(d_name, ()))
+        else:
+            affected_dialects = None
+
+    # Order tests matching patched module stems first among fast tests so failures are caught immediately
+    if patched_stems and len(nums) > 1:
+        paired = sorted(
+            zip(nums, ids),
+            key=lambda x: (
+                0 if dur[x[0]] < 250 and any(f"test_{s}.py" in x[1] for s in patched_stems) else (1 if dur[x[0]] < 250 else 2),
+                dur[x[0]],
+            ),
+        )
+        nums = [x[0] for x in paired]
+        ids = [x[1] for x in paired]
 
     def _fast_tpc_check(kind: str) -> bool:
         from tests.helpers import load_sql_fixture_pairs, TPCDS_SCHEMA, TPCH_SCHEMA
@@ -1402,6 +1499,10 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
 
             parts = tid.split("::")
             fpath, cname, mname = parts[0], parts[1], parts[2]
+            # If sqlglot/serde.py is broken, ProcessPoolExecutor pickling fails even when InlinePool passes
+            if fail_count >= 2 and "sqlglot/serde.py" in patched:
+                break
+
             if can_surrogate_max_nodes and fpath == "tests/test_parser.py" and mname == "test_max_nodes":
                 try:
                     passed = _fast_max_nodes_check()
@@ -1430,16 +1531,25 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
                     confirmed_fail.add(tnum)
                     fail_count += 1
                 continue
-            if can_surrogate_tpc and fpath == "tests/test_executor.py" and mname in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"):
+            if can_surrogate_tpc and (
+                (fpath == "tests/test_executor.py" and mname in ("test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"))
+                or (fpath == "tests/test_optimizer.py" and mname in ("test_tpcds", "test_tpch"))
+            ):
                 passed = False
                 try:
-                    if mname == "test_execute_tpcds":
+                    if mname in ("test_execute_tpcds", "test_tpcds"):
                         ref = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
-                        passed = test_outcomes[ref] if ref in test_outcomes else _fast_tpc_check("tpcds")
+                        if affected_dialects is not None and "duckdb" not in affected_dialects:
+                            passed = True
+                        else:
+                            passed = test_outcomes[ref] if ref in test_outcomes else _fast_tpc_check("tpcds")
                         test_outcomes[ref] = passed
                     else:
                         ref = "tests/test_optimizer.py::TestOptimizer::test_tpch"
-                        passed = test_outcomes[ref] if ref in test_outcomes else _fast_tpc_check("tpch")
+                        if affected_dialects is not None and "duckdb" not in affected_dialects:
+                            passed = True
+                        else:
+                            passed = test_outcomes[ref] if ref in test_outcomes else _fast_tpc_check("tpch")
                         test_outcomes[ref] = passed
                 except BaseException:
                     passed = False
@@ -1454,13 +1564,15 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
                     fail_count += 1
                 continue
 
-            # If sqlglot/serde.py is broken, ProcessPoolExecutor pickling fails even when InlinePool passes
-            if fail_count >= 2 and "sqlglot/serde.py" in patched:
-                break
-            # If catastrophic breakage (many failures and almost no passes), skip expensive non-surrogate tests
-            if dur[tnum] >= 120:
-                if (fail_count >= 2 and pass_count == 0 and not can_surrogate_tpc) or (fail_count >= 6 and fail_count > pass_count * 2):
-                    continue
+            # Once at least 1 test has failed, the 2.0s worker cost is already sunk;
+            # on larger candidate sets, skip expensive or remaining non-surrogate tests to avoid burning server CPU
+            if (
+                fail_count >= 4
+                or (fail_count >= 2 and len(all_ln) > 35)
+                or (fail_count >= 1 and len(all_ln) > 35 and (dur[tnum] >= 80 or pass_count + fail_count >= 10))
+                or (fail_count >= 1 and dur[tnum] >= 1500)
+            ):
+                continue
 
             mod_name = fpath[:-3].replace("/", ".")
             try:
@@ -1493,6 +1605,20 @@ def run_child(farm: Path, patched: dict, nums: list[int], ids: list[str], hn: li
                             return orig_check_file(self, file, func, pretty=pretty, execute=False, only=only, **kwargs)
 
                         to_cls.check_file = _fast_check_file
+                        if affected_dialects is not None:
+                            orig_load_pairs = mod.load_sql_fixture_pairs
+
+                            def _dialect_load_pairs(fname):
+                                pairs = orig_load_pairs(fname)
+                                if f"tests/fixtures/{fname}" in patched:
+                                    return pairs
+                                return [
+                                    (m, s, e)
+                                    for m, s, e in pairs
+                                    if {w.strip().lower() for w in (m.get("dialect") or "").split(",") if w.strip()} & affected_dialects
+                                ]
+
+                            mod.load_sql_fixture_pairs = _dialect_load_pairs
                     elif mod_name == "tests.test_executor" and hasattr(mod, "TestExecutor"):
                         mod.ProcessPoolExecutor = InlinePool
                         te_cls = mod.TestExecutor
