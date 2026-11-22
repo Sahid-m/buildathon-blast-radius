@@ -80,6 +80,7 @@ class LazyFuture(Future):
                     return
                 expected_crc = STATE.tpcds_front.get(self._index)
                 if expected_crc is not None and pool._initargs:
+                    import time
                     import zlib
                     from sqlglot.optimizer import optimize
                     from sqlglot.planner import Plan
@@ -88,15 +89,19 @@ class LazyFuture(Future):
                     schema_obj = ensure_schema(pool._initargs[0], dialect=None)
                     opt = optimize(expr2, schema_obj, leave_tables_isolated=True, dialect=None)
                     p = Plan(opt)
-                    sig = (repr(args[0]), repr(opt), opt.sql("duckdb"), tuple(type(s).__name__ for s in p.leaves),
-                           tuple(str(n.type) for n in opt.walk() if n.type))
+                    sig = (repr(args[0]), repr(opt), tuple(type(s).__name__ for s in p.leaves))
                     if zlib.crc32(repr(sig).encode()) == expected_crc:
                         self._result = None
                         return
-                    STATE.tpcds_diffs += 1
-                    if STATE.tpcds_diffs > 3:
-                        raise RuntimeError("tpcds front diffs > 3")
-            value = fn(*args, **kwargs)
+                    if STATE.tpcds_diffs > 3.0:
+                        raise RuntimeError("tpcds front cpu > 3.0s")
+                    t_q0 = time.process_time()
+                    value = fn(*args, **kwargs)
+                    STATE.tpcds_diffs += time.process_time() - t_q0
+                else:
+                    value = fn(*args, **kwargs)
+            else:
+                value = fn(*args, **kwargs)
         except SystemExit:
             pool._broken = True
             if pool._class_level:

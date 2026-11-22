@@ -52,8 +52,7 @@ def main():
             e = parse_one(sql)
             opt = optimize(e.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
             p = Plan(opt)
-            sig = (repr(e), repr(opt), opt.sql("duckdb"), tuple(type(s).__name__ for s in p.leaves),
-                   tuple(str(n.type) for n in opt.walk() if n.type))
+            sig = (repr(e), repr(opt), tuple(type(s).__name__ for s in p.leaves))
             front[i] = zlib.crc32(repr(sig).encode())
     fpath = os.path.join(out, "tpcds_front.bin")
     with open(fpath + ".tmp", "wb") as f:

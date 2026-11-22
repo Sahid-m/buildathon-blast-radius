@@ -3523,6 +3523,28 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
             before = len(plan.cands)
             plan.cands &= readers | plan.data_cands
             plan.note.append("key map: %d -> %d" % (before, len(plan.cands)))
+        elif keymap.plan_ok(plan, ROOT) and not any(r[1] for r in keys):
+            km = keymap.load(MAPS)
+            if km is not None:
+                t_rows = [(r[0], r[2]) for r in keys if len(r) >= 3 and r[2] is not None]
+                nt_rows = [r for r in keys if len(r) < 3 or r[2] is None]
+                comb = km.readers(t_rows) if t_rows else set()
+                ok_comb = comb is not None and bool(t_rows) and bool(nt_rows)
+                for r in nt_rows if ok_comb else ():
+                    k = r[0]
+                    sub = classmap_readers([r], maps)
+                    if sub is None and k[0] == "A" and len(k) == 4 and k[3] in ("_sql_names", "arg_types", "is_var_len_args"):
+                        cu = maps.class_users("%s.%s" % (k[1], k[2]))
+                        if cu is not None:
+                            sub = set(cu)
+                    if sub is None:
+                        ok_comb = False
+                        break
+                    comb |= sub
+                if ok_comb:
+                    before = len(plan.cands)
+                    plan.cands &= comb | plan.data_cands
+                    plan.note.append("combined map: %d -> %d" % (before, len(plan.cands)))
     if not keys and not plan.fpairs and not plan.work:
         # Nothing that the import leaves behind differs. The edit very likely does nothing;
         # the cheapest candidates still run as a check, and nothing is selected unrun.
@@ -3628,8 +3650,7 @@ def get_tpcds_front():
                         e = parse_one(sql)
                         opt = optimize(e.copy(), schema_obj, leave_tables_isolated=True, dialect=None)
                         p = SqlPlan(opt)
-                        sig = (repr(e), repr(opt), opt.sql("duckdb"), tuple(type(s).__name__ for s in p.leaves),
-                               tuple(str(n.type) for n in opt.walk() if n.type))
+                        sig = (repr(e), repr(opt), tuple(type(s).__name__ for s in p.leaves))
                         front[i] = zlib.crc32(repr(sig).encode())
                 _TPCDS_FRONT[0] = front
             except Exception:
@@ -4126,26 +4147,45 @@ def run(t_start, deadline, state):
         # Tests that were too costly to run have no verdict. They are selected, with one
         # exception: a very long test (the TPC-DS run, for instance) is left out unless a
         # failing test is close to it (same test class, or same fixture file) or many tests fail.
-        if "import state unchanged" in plan.note and not failing and not plan.broken and not unknown:
+        broken_only = (
+            bool(plan.broken)
+            and not plan.data_cands
+            and all(p.endswith(".py") and p[:-3].replace("/", ".") in plan.broken for p in plan.files)
+        )
+        if ("import state unchanged" in plan.note and not failing and not plan.broken and not unknown) or broken_only:
             # the import left nothing different and the cheapest candidates pass; a held test
             # that reads a data file of the patch (a fixture edited beside the code) can still
             # fail, so it stays selected
             selected.update(n for n in held if n in plan.data_cands)
-        elif plan.broken or not verdicts or unknown:
+        elif not verdicts or unknown:
             selected.update(held)
         else:
             # On labeled mutants, a long test fails together with another test of its class
             # (or of its fixture file) in nearly every case, and almost never without one.
             # The tests of its class did run (see protect below), so their verdicts decide.
-            if not failing and len(verdicts) >= 15:
-                tested_cls = collections.Counter(tests[n]["id"].rsplit("::", 1)[0] for n in verdicts)
+            tested_cls = collections.Counter(tests[n]["id"].rsplit("::", 1)[0] for n in verdicts)
+            if not failing and len(verdicts) >= 8:
                 selected.update(
                     n for n in held
                     if seconds[n] <= QUIET_HOLD_SECONDS
-                    and (tested_cls[tests[n]["id"].rsplit("::", 1)[0]] < 2 or n in plan.data_cands)
+                    and (tested_cls[tests[n]["id"].rsplit("::", 1)[0]] < 1 or n in plan.data_cands)
                 )
             else:
-                selected.update(n for n in held if seconds[n] <= QUIET_HOLD_SECONDS)
+                class_of = lambda n: tests[n]["id"].rsplit("::", 1)[0]
+                fail_classes = {class_of(n) for n in failing}
+                fail_fixtures = {f for n in failing for f in fixtures_of(n)}
+                more = 1 if plan.econ else 0
+                selected.update(
+                    n for n in held
+                    if seconds[n] <= QUIET_HOLD_SECONDS
+                    and (
+                        class_of(n) in fail_classes
+                        or (fail_fixtures & fixtures_of(n))
+                        or len(failing) + more >= MANY_FAILURES
+                        or tested_cls[class_of(n)] < 1
+                        or n in plan.data_cands
+                    )
+                )
             # (with many failures: a commit that breaks this much can break any test)
             # (one more failure is counted when marginal_holds held tests: the first failing
             # test of the runs before that rule may be one of them)
@@ -4252,13 +4292,21 @@ def run(t_start, deadline, state):
         plan.protect = {n for n in ran if tests[n]["id"].rsplit("::", 1)[0] in protect_classes
                         or (protect_fixtures and protect_fixtures & fixtures_of(n) and cost[n] <= 2.0)}
         if sum(cost[n] for n in ran) > budget:
+            by_cls = {}
+            for n in sorted(ran, key=lambda n: cost[n]):
+                if cost[n] <= 0.12:
+                    cid = tests[n]["id"].rsplit("::", 1)[0]
+                    if cid not in by_cls:
+                        by_cls[cid] = n
+            cls_reps = set(by_cls.values())
+            plan.protect.update(cls_reps)
             # The CPU limit does not allow every run. A held test is selected as it is, which
             # costs its recorded seconds: so the runs that save the most recorded seconds per
             # CPU second go first, and the tests that are cheap to select are the ones held.
             keep_set, acc = set(), 0.0
-            for n in sorted(ran, key=lambda n: (n not in plan.protect and tests[n]["id"] not in SCALED_IDS,
+            for n in sorted(ran, key=lambda n: (n not in cls_reps, n not in plan.protect and tests[n]["id"] not in SCALED_IDS,
                                                 -(seconds[n] + 0.002) / (cost[n] + 0.002), cost[n])):
-                if acc + cost[n] > budget and tests[n]["id"] not in SCALED_IDS and seconds[n] <= 20.0:
+                if acc + cost[n] > budget and tests[n]["id"] not in SCALED_IDS and seconds[n] <= 20.0 and n not in cls_reps:
                     continue  # a test with a small-scale variant always runs (see compute_keeps)
                 if seconds[n] <= 20.0:
                     acc += cost[n]
